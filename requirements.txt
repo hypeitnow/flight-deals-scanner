@@ -1,0 +1,2 @@
+# No third-party dependencies required — uses the Python standard library only
+# (urllib, sqlite3, json, argparse). Python 3.10+ recommended.

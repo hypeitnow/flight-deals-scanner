@@ -1,0 +1,38 @@
+{
+  "amadeus_env": "test",
+
+  "origins": { "group": "poland_major" },
+  "currency": "PLN",
+  "adults": 1,
+  "non_stop": false,
+  "max_offers_per_query": 5,
+
+  "scan": {
+    "date_from": "2026-07-03",
+    "date_to": "2026-09-30",
+    "weekdays": [4, 5],
+    "trip_length_days": [5, 7],
+    "max_dates_per_route": 4
+  },
+
+  "destinations": [
+    { "country": "ME", "label": "Montenegro",          "target_price": 600 },
+    { "country": "BA", "label": "Bosnia & Herzegovina", "target_price": 650 },
+    { "country": "HR", "label": "Croatia",              "target_price": 500 }
+  ],
+
+  "limits": {
+    "max_api_calls": 500
+  },
+
+  "bargain": {
+    "percentile": 25,
+    "min_history": 5,
+    "drop_pct_alert": 15
+  },
+
+  "notify": {
+    "telegram": { "enabled": false, "bot_token": "", "chat_id": "" },
+    "webhook":  { "enabled": false, "url": "" }
+  }
+}

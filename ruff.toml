@@ -1,0 +1,6 @@
+[lint]
+select = ["E", "F", "W", "I"]
+ignore = [
+    "E501",   # line too long (intentionally wide demo output)
+    "E402",   # module-level import not at top (test path bootstrap requires sys.path before import)
+]
