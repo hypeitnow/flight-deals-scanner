@@ -20,9 +20,11 @@ Config schema supports:
 from __future__ import annotations
 
 import argparse
+import csv
 import datetime as dt
 import hashlib
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -34,6 +36,8 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+
+logger = logging.getLogger("flight_scanner")
 
 ROOT        = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "config.json"
@@ -73,6 +77,21 @@ def load_airports(path: Path = AIRPORTS_PATH) -> dict:
         sys.exit(f"Airport data not found: {path}")
     with path.open() as fh:
         return json.load(fh)
+
+
+# --------------------------------------------------------------------------- #
+# IMP-9: Structured logging
+# --------------------------------------------------------------------------- #
+def setup_logging(verbose: bool = False, quiet: bool = False) -> None:
+    """Configure root logger. Verbose=DEBUG, quiet=WARNING, default=INFO."""
+    level = logging.DEBUG if verbose else logging.WARNING if quiet else logging.INFO
+    logging.basicConfig(
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+        level=level,
+        stream=sys.stderr,
+    )
+    logger.setLevel(level)
 
 
 # --------------------------------------------------------------------------- #
@@ -174,23 +193,30 @@ def db_connect(path: Path = DB_PATH) -> sqlite3.Connection:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS observations (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
-            scanned_at    TEXT NOT NULL,
-            origin        TEXT NOT NULL,
-            destination   TEXT NOT NULL,
-            depart_date   TEXT NOT NULL,
-            return_date   TEXT,
-            price         REAL NOT NULL,
-            currency      TEXT NOT NULL,
-            carriers      TEXT,
-            stops         INTEGER,
-            duration_min  INTEGER
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            scanned_at       TEXT NOT NULL,
+            origin           TEXT NOT NULL,
+            destination      TEXT NOT NULL,
+            depart_date      TEXT NOT NULL,
+            return_date      TEXT,
+            price            REAL NOT NULL,
+            currency         TEXT NOT NULL,
+            carriers         TEXT,
+            stops            INTEGER,
+            duration_min     INTEGER,
+            return_stops     INTEGER,
+            return_duration_min INTEGER
         )
         """
     )
     # Migrate existing DBs that lack the new columns
     existing = {row[1] for row in conn.execute("PRAGMA table_info(observations)")}
-    for col, typedef in [("stops", "INTEGER"), ("duration_min", "INTEGER")]:
+    for col, typedef in [
+        ("stops", "INTEGER"),
+        ("duration_min", "INTEGER"),
+        ("return_stops", "INTEGER"),        # IMP-8
+        ("return_duration_min", "INTEGER"),  # IMP-8
+    ]:
         if col not in existing:
             conn.execute(f"ALTER TABLE observations ADD COLUMN {col} {typedef}")
     conn.execute(
@@ -235,13 +261,15 @@ def record_observation(conn: sqlite3.Connection, obs: dict) -> None:
     conn.execute(
         """INSERT INTO observations
            (scanned_at, origin, destination, depart_date, return_date,
-            price, currency, carriers, stops, duration_min)
-           VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            price, currency, carriers, stops, duration_min,
+            return_stops, return_duration_min)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             obs["scanned_at"], obs["origin"], obs["destination"],
             obs["depart_date"], obs.get("return_date"), obs["price"],
             obs["currency"], obs.get("carriers", ""),
             obs.get("stops"), obs.get("duration_min"),
+            obs.get("return_stops"), obs.get("return_duration_min"),
         ),
     )
     conn.commit()
@@ -429,11 +457,26 @@ class AmadeusClient:
         best = min(data, key=lambda o: float(o["price"]["total"]))
         carriers = ",".join(sorted(set(best.get("validatingAirlineCodes", []))))
 
+        itineraries = best.get("itineraries", [])
+
         # Outbound itinerary stops + duration  (FLIGHT-3)
-        outbound = best.get("itineraries", [{}])[0]
+        outbound = itineraries[0] if itineraries else {}
         segments = outbound.get("segments", [])
         stops = sum(s.get("numberOfStops", 0) for s in segments) + max(len(segments) - 1, 0)
         duration_min = _parse_iso_duration(outbound.get("duration", ""))
+
+        # Return itinerary stops + duration  (IMP-8)
+        return_stops: int | None = None
+        return_duration_min: int | None = None
+        if len(itineraries) > 1:
+            inbound = itineraries[1]
+            in_segments = inbound.get("segments", [])
+            if in_segments:
+                return_stops = (
+                    sum(s.get("numberOfStops", 0) for s in in_segments)
+                    + max(len(in_segments) - 1, 0)
+                )
+            return_duration_min = _parse_iso_duration(inbound.get("duration", "")) or None
 
         return {
             "price": float(best["price"]["total"]),
@@ -441,7 +484,47 @@ class AmadeusClient:
             "carriers": carriers,
             "stops": stops,
             "duration_min": duration_min,
+            "return_stops": return_stops,
+            "return_duration_min": return_duration_min,
         }
+
+    def cheapest_dates(
+        self,
+        origin: str,
+        destination: str,
+        currency: str,
+        duration: int | None = None,
+        non_stop: bool = False,
+        max_results: int = 5,
+    ) -> list[dict]:
+        """Call /v1/shopping/flight-dates → top-N cheapest date pairs for a route.
+
+        Returns list of {depart_date, return_date, price}, sorted by price ascending.
+        One call replaces N separate flight-offers queries — big quota savings (IMP-7).
+        """
+        params: dict = {
+            "origin": origin,
+            "destination": destination,
+            "currency": currency,
+            "viewBy": "DATE",
+        }
+        if duration is not None:
+            params["duration"] = duration
+        else:
+            params["oneWay"] = "true"
+        if non_stop:
+            params["nonStop"] = "true"
+        data = self._get("/v1/shopping/flight-dates", params).get("data", [])
+        results = []
+        for item in data:
+            try:
+                price = float(item["price"]["total"])
+                depart = item["departureDate"]
+                ret = item.get("returnDate")
+                results.append({"depart_date": depart, "return_date": ret, "price": price})
+            except (KeyError, ValueError):
+                continue
+        return sorted(results, key=lambda x: x["price"])[:max_results]
 
 
 # --------------------------------------------------------------------------- #
@@ -480,9 +563,9 @@ def estimate_calls(origins: list[str], destinations: list[dict], date_pairs: lis
 
 
 def check_budget(estimated: int, limits: dict) -> None:
-    """Print estimate; exit if over budget cap."""
+    """Log estimate; exit if over budget cap."""
     cap = limits.get("max_api_calls", 500)
-    print(f"  Estimated API calls: {estimated}  (cap: {cap})")
+    logger.info("Estimated API calls: %d  (cap: %d)", estimated, cap)
     if estimated > cap:
         sys.exit(
             f"\nAborted: {estimated} estimated API calls exceeds the cap of {cap}.\n"
@@ -507,6 +590,62 @@ def evaluate_bargain(price, target_price, history, rules) -> tuple[bool, str]:
         if drop_pct >= rules.get("drop_pct_alert", 15):
             reasons.append(f"-{drop_pct:.0f}% vs prev low")
     return bool(reasons), "; ".join(reasons)
+
+
+# --------------------------------------------------------------------------- #
+# IMP-10: Booking deep-links + export
+# --------------------------------------------------------------------------- #
+def build_deeplinks(obs: dict) -> dict:
+    """Generate booking deep-links (Kayak + Skyscanner) for an observation."""
+    o = obs["origin"]
+    d = obs["destination"]
+    dep = obs["depart_date"]
+    ret = obs.get("return_date") or ""
+
+    if ret:
+        kayak = f"https://www.kayak.com/flights/{o}-{d}/{dep}/{ret}"
+    else:
+        kayak = f"https://www.kayak.com/flights/{o}-{d}/{dep}"
+
+    # Skyscanner uses YYMMDD date format
+    dep_sky = dep[2:].replace("-", "")  # "2026-07-11" → "260711"
+    if ret:
+        ret_sky = ret[2:].replace("-", "")
+        sky = (
+            f"https://www.skyscanner.net/transport/flights"
+            f"/{o.lower()}/{d.lower()}/{dep_sky}/{ret_sky}/"
+        )
+    else:
+        sky = (
+            f"https://www.skyscanner.net/transport/flights"
+            f"/{o.lower()}/{d.lower()}/{dep_sky}/"
+        )
+
+    return {"kayak": kayak, "skyscanner": sky}
+
+
+def export_results(observations: list[dict], filepath: Path, fmt: str) -> None:
+    """Write observations to JSON or CSV file, including booking deep-links."""
+    if not observations:
+        print("  (no observations to export)")
+        return
+    # Enrich with deeplinks
+    enriched = [{**obs, "deeplinks": build_deeplinks(obs)} for obs in observations]
+    if fmt == "json":
+        with filepath.open("w", encoding="utf-8") as fh:
+            json.dump(enriched, fh, indent=2)
+    elif fmt == "csv":
+        flat = []
+        for obs in enriched:
+            row = {k: v for k, v in obs.items() if k != "deeplinks"}
+            row["link_kayak"] = obs["deeplinks"]["kayak"]
+            row["link_skyscanner"] = obs["deeplinks"]["skyscanner"]
+            flat.append(row)
+        with filepath.open("w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=list(flat[0].keys()))
+            writer.writeheader()
+            writer.writerows(flat)
+    print(f"  Exported {len(observations)} observations → {filepath} ({fmt.upper()})")
 
 
 # --------------------------------------------------------------------------- #
@@ -540,6 +679,9 @@ def notify(alerts: list[dict], cfg: dict, conn: sqlite3.Connection | None = None
             f"{route:12} {dates:22} {a['price']:>8.0f} {a['currency']}"
             f"  {stops_str:10} [{a['reason']}]"
         )
+        # IMP-10: booking deep-link
+        links = build_deeplinks(a)
+        lines.append(f"  🔗 {links['kayak']}")
     message = "\n".join(lines)
 
     if tg.get("enabled"):
@@ -584,9 +726,24 @@ def _post_webhook(url: str, payload: dict) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Scan  (IMP-1: error isolation; IMP-2: quota tracking; IMP-6: concurrent)
+# Scan  (IMP-1: error isolation; IMP-2: quota tracking; IMP-6: concurrent;
+#        IMP-7: dates mode; IMP-8: stop/duration filters; IMP-9: logging)
 # --------------------------------------------------------------------------- #
-def run_scan(cfg: dict, conn, fetcher, origins: list[str], destinations: list[dict]) -> list[dict]:
+def run_scan(
+    cfg: dict,
+    conn: sqlite3.Connection,
+    fetcher,
+    origins: list[str],
+    destinations: list[dict],
+    dates_fetcher=None,
+) -> list[dict]:
+    """Run a full scan and return all bargain alerts found.
+
+    Args:
+        dates_fetcher: Optional callable(origin, dest, currency, duration, non_stop)
+            → list[{depart_date, return_date, price}].  When provided (IMP-7 dates
+            mode) a pre-pass finds cheapest dates per route — one call instead of N.
+    """
     currency    = cfg.get("currency", "EUR")
     adults      = cfg.get("adults", 1)
     non_stop    = cfg.get("non_stop", False)
@@ -594,19 +751,29 @@ def run_scan(cfg: dict, conn, fetcher, origins: list[str], destinations: list[di
     rules       = cfg.get("bargain", {})
     limits      = cfg.get("limits", {})
     max_workers = limits.get("max_workers", 4)
-    date_pairs  = generate_date_pairs(cfg["scan"])
+    scan_cfg    = cfg.get("scan", {})
+    date_pairs  = generate_date_pairs(scan_cfg)
     now         = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+
+    # IMP-8: stop / duration filters from scan config
+    max_stops_cfg    = scan_cfg.get("max_stops")
+    max_duration_cfg = scan_cfg.get("max_duration_min")
 
     total_dest = sum(len(d["airports"]) for d in destinations)
     estimated  = estimate_calls(origins, destinations, date_pairs)
-    print(f"Scanning {len(origins)} origin(s) × {total_dest}"
-          f" dest airport(s) × {len(date_pairs)} date(s)")
+    logger.info(
+        "Scanning %d origin(s) × %d dest airport(s) × %d date(s)",
+        len(origins), total_dest, len(date_pairs),
+    )
 
     # IMP-2: monthly quota check
     if "monthly_cap" in limits:
         month_used, _ = monthly_usage(conn)
         remaining = limits["monthly_cap"] - month_used
-        print(f"  Monthly usage: {month_used}/{limits['monthly_cap']} used  ({remaining} remaining)")
+        logger.info(
+            "Monthly usage: %d/%d used  (%d remaining)",
+            month_used, limits["monthly_cap"], remaining,
+        )
         if month_used + estimated > limits["monthly_cap"]:
             sys.exit(
                 f"\nAborted: {month_used} used + {estimated} estimated = "
@@ -615,7 +782,6 @@ def run_scan(cfg: dict, conn, fetcher, origins: list[str], destinations: list[di
             )
 
     check_budget(estimated, limits)
-    print()
 
     # Per-group accumulators (all written from the main thread via as_completed)
     group_best_by_pair: list[dict] = [{} for _ in destinations]
@@ -623,13 +789,48 @@ def run_scan(cfg: dict, conn, fetcher, origins: list[str], destinations: list[di
     route_errors: list[str] = []
     calls_made = 0
 
-    # IMP-6: flat task list for concurrent execution
+    # IMP-7: Dates mode — pre-pass to get cheapest dates per route
+    # If dates_fetcher is provided, replace per-route date_pairs with top-N cheap dates.
+    route_date_pairs: dict[tuple, list] = {}
+    if dates_fetcher is not None:
+        trip_lengths = scan_cfg.get("trip_length_days") or [None]
+        duration = int(trip_lengths[0]) if trip_lengths[0] is not None else None
+        date_from_d = dt.date.fromisoformat(scan_cfg["date_from"])
+        date_to_d   = dt.date.fromisoformat(scan_cfg["date_to"])
+        top_n = limits.get("dates_mode_top_n", 3)
+        logger.info("Dates-mode pre-pass: fetching cheapest dates per route (top %d)…", top_n)
+        for origin in origins:
+            for dest_group in destinations:
+                for dest_iata in dest_group["airports"]:
+                    try:
+                        cheap = dates_fetcher(
+                            origin, dest_iata, currency, duration, non_stop, top_n
+                        )
+                        in_window = [
+                            (d["depart_date"], d["return_date"])
+                            for d in cheap
+                            if date_from_d
+                            <= dt.date.fromisoformat(d["depart_date"])
+                            <= date_to_d
+                        ]
+                        route_date_pairs[(origin, dest_iata)] = in_window or date_pairs[:2]
+                    except Exception as exc:
+                        logger.warning(
+                            "Dates-mode fallback for %s→%s: %s", origin, dest_iata, exc
+                        )
+                        route_date_pairs[(origin, dest_iata)] = date_pairs
+
+    # Build flat task list
     tasks = [
         (g_idx, origin, dest_iata, depart, ret)
         for g_idx, dest_group in enumerate(destinations)
         for origin in origins
         for dest_iata in dest_group["airports"]
-        for depart, ret in date_pairs
+        for depart, ret in (
+            route_date_pairs.get((origin, dest_iata), date_pairs)
+            if dates_fetcher is not None
+            else date_pairs
+        )
     ]
 
     def _fetch(g_idx, origin, dest_iata, depart, ret):
@@ -652,18 +853,36 @@ def run_scan(cfg: dict, conn, fetcher, origins: list[str], destinations: list[di
             if not offer:
                 continue
 
+            # IMP-8: apply outbound stop / duration filters
+            if max_stops_cfg is not None and offer.get("stops") is not None:
+                if offer["stops"] > max_stops_cfg:
+                    logger.debug(
+                        "Filtered %s→%s %s: stops=%d > max_stops=%d",
+                        origin, dest_iata, depart, offer["stops"], max_stops_cfg,
+                    )
+                    continue
+            if max_duration_cfg is not None and offer.get("duration_min"):
+                if offer["duration_min"] > max_duration_cfg:
+                    logger.debug(
+                        "Filtered %s→%s %s: duration=%d > max_duration_min=%d",
+                        origin, dest_iata, depart, offer["duration_min"], max_duration_cfg,
+                    )
+                    continue
+
             target = destinations[g_idx].get("target_price")
             obs = {
-                "scanned_at":   now,
-                "origin":       origin,
-                "destination":  dest_iata,
-                "depart_date":  depart,
-                "return_date":  ret,
-                "price":        offer["price"],
-                "currency":     offer["currency"],
-                "carriers":     offer.get("carriers", ""),
-                "stops":        offer.get("stops"),
-                "duration_min": offer.get("duration_min"),
+                "scanned_at":          now,
+                "origin":              origin,
+                "destination":         dest_iata,
+                "depart_date":         depart,
+                "return_date":         ret,
+                "price":               offer["price"],
+                "currency":            offer["currency"],
+                "carriers":            offer.get("carriers", ""),
+                "stops":               offer.get("stops"),
+                "duration_min":        offer.get("duration_min"),
+                "return_stops":        offer.get("return_stops"),        # IMP-8
+                "return_duration_min": offer.get("return_duration_min"), # IMP-8
             }
             # DB writes are in the main thread — no lock needed
             record_observation(conn, obs)
@@ -678,15 +897,17 @@ def run_scan(cfg: dict, conn, fetcher, origins: list[str], destinations: list[di
 
     # IMP-1: surface route errors
     if route_errors:
-        print(f"  ⚠️  {len(route_errors)} route(s) failed:")
+        logger.warning("%d route(s) failed:", len(route_errors))
         for msg in route_errors[:10]:
-            print(f"    {msg}")
+            logger.warning("  %s", msg)
         if len(route_errors) > 10:
-            print(f"    ... and {len(route_errors) - 10} more")
-        print()
+            logger.warning("  … and %d more", len(route_errors) - 10)
 
-    # Aggregate and print per destination group
+    # Per-destination summary (IMP-9: use logger.info for per-route lines)
     all_alerts: list[dict] = []
+    cheapest_obs: dict | None = None
+    cheapest_price = float("inf")
+
     for g_idx, dest_group in enumerate(destinations):
         label        = dest_group["label"]
         best_by_pair = group_best_by_pair[g_idx]
@@ -694,7 +915,7 @@ def run_scan(cfg: dict, conn, fetcher, origins: list[str], destinations: list[di
         all_alerts.extend(alerts)
 
         if not best_by_pair:
-            print(f"  {label}: no offers found")
+            logger.info("  %s: no offers found", label)
             continue
 
         ranked = sorted(best_by_pair.values(), key=lambda o: o["price"])
@@ -707,11 +928,20 @@ def run_scan(cfg: dict, conn, fetcher, origins: list[str], destinations: list[di
         dur  = (f" {best['duration_min']//60}h{best['duration_min']%60:02d}m"
                 if best.get("duration_min") else "")
         fire = " 🔥" if alerts else ""
-        print(f"  {'['+label+']':22}  best: {best['origin']}→{best['destination']}"
-              f"  {best['price']:>8.0f} {best['currency']}"
-              f"  {stops_str}{dur}"
-              f"  {best['depart_date']}{('..'+best['return_date']) if best['return_date'] else ''}"
-              f"{fire}")
+        logger.info(
+            "  [%-20s]  best: %s→%s  %8.0f %s  %s%s  %s%s%s",
+            label, best["origin"], best["destination"],
+            best["price"], best["currency"],
+            stops_str, dur,
+            best["depart_date"],
+            (".." + best["return_date"]) if best.get("return_date") else "",
+            fire,
+        )
+
+        # Track cheapest across all groups for run summary
+        if best["price"] < cheapest_price:
+            cheapest_price = best["price"]
+            cheapest_obs = best
 
         if len(origins) > 1:
             seen  = set()
@@ -723,16 +953,35 @@ def run_scan(cfg: dict, conn, fetcher, origins: list[str], destinations: list[di
                 seen.add(key)
                 s = ("direct" if obs.get("stops") == 0
                      else f"{obs['stops']} stop(s)" if obs.get("stops") is not None else "?")
-                print(f"  {'':22}  alt:  {obs['origin']}→{obs['destination']}"
-                      f"  {obs['price']:>8.0f} {obs['currency']}  {s}"
-                      f"  {obs['depart_date']}{('..'+obs['return_date']) if obs['return_date'] else ''}")
+                logger.info(
+                    "  %22s  alt:  %s→%s  %8.0f %s  %s  %s%s",
+                    "", obs["origin"], obs["destination"],
+                    obs["price"], obs["currency"], s,
+                    obs["depart_date"],
+                    (".." + obs["return_date"]) if obs.get("return_date") else "",
+                )
                 count += 1
                 if count >= 3:
                     break
 
-    print()
     # IMP-2: record this run for monthly quota tracking
     record_scan_run(conn, calls_made, len(all_alerts))
+
+    # IMP-9: always-visible run summary (print, not logger — shown at all log levels)
+    print(f"\n── Run summary {'─' * 45}")
+    print(f"   Routes scanned  : {len(tasks)}")
+    print(f"   API calls made  : {calls_made}")
+    print(f"   Alerts found    : {len(all_alerts)}")
+    if route_errors:
+        print(f"   Route errors    : {len(route_errors)}")
+    if cheapest_obs:
+        print(
+            f"   Cheapest overall: {cheapest_obs['origin']}→{cheapest_obs['destination']}"
+            f"  {cheapest_obs['price']:.0f} {cheapest_obs['currency']}"
+            f"  {cheapest_obs['depart_date']}"
+        )
+    print(f"{'─' * 60}")
+
     return all_alerts
 
 
@@ -777,6 +1026,49 @@ def make_demo_fetcher():
     return fetcher
 
 
+def make_demo_dates_fetcher():
+    """Demo version of cheapest_dates() — deterministic per (origin, dest).
+
+    Returns a sorted list of synthetic cheapest dates without any API calls.
+    Used by --demo when scan.mode is 'dates'.  (IMP-7)
+    """
+    import random
+
+    BASE_PRICES = {
+        "TGD": 480, "TIV": 460,
+        "SJJ": 520, "OMO": 580, "TZL": 590, "BNX": 600,
+        "ZAG": 350, "SPU": 420, "DBV": 500,
+        "BCN": 380, "FCO": 340, "CDG": 300, "LIS": 450, "ATH": 420,
+        "BEG": 280, "SKP": 320,
+    }
+
+    def fetcher(
+        origin: str, dest: str, currency: str,
+        duration: int | None = None, non_stop: bool = False, max_results: int = 5,
+    ) -> list[dict]:
+        seed_str = f"dates|{origin}|{dest}"
+        seed = int(hashlib.md5(seed_str.encode()).hexdigest()[:8], 16)
+        rnd = random.Random(seed)
+        base = BASE_PRICES.get(dest, 400)
+        results = []
+        for month in [7, 8, 9]:
+            for day in rnd.sample(range(1, 29), min(4, max_results + 1)):
+                try:
+                    d = dt.date(2026, month, day)
+                    ret_d = (d + dt.timedelta(days=duration or 5)) if duration else None
+                    price = float(max(base + rnd.randint(-80, 80), 90))
+                    results.append({
+                        "depart_date": d.isoformat(),
+                        "return_date": ret_d.isoformat() if ret_d else None,
+                        "price": price,
+                    })
+                except ValueError:
+                    continue
+        return sorted(results, key=lambda x: x["price"])[:max_results]
+
+    return fetcher
+
+
 # --------------------------------------------------------------------------- #
 # History view
 # --------------------------------------------------------------------------- #
@@ -810,7 +1102,17 @@ def main() -> None:
     parser.add_argument("--quota",    action="store_true",
                         help="Show month-to-date API call usage and exit.")  # IMP-2
     parser.add_argument("--config",   default=str(CONFIG_PATH))
+    # IMP-9: log level flags
+    parser.add_argument("--verbose",  action="store_true",
+                        help="Enable DEBUG-level logging.")
+    parser.add_argument("--quiet",    action="store_true",
+                        help="Suppress INFO logs; show warnings and errors only.")
+    # IMP-10: export
+    parser.add_argument("--export", choices=["json", "csv"], metavar="FORMAT",
+                        help="Export scan results to file: json or csv.")
     args = parser.parse_args()
+
+    setup_logging(verbose=args.verbose, quiet=args.quiet)  # IMP-9
 
     load_env()
     conn     = db_connect()
@@ -840,21 +1142,35 @@ def main() -> None:
         est = estimate_calls(origins, destinations, date_pairs)
         total_dest = sum(len(d["airports"]) for d in destinations)
         cap = cfg.get("limits", {}).get("max_api_calls", 500)
+        mode = cfg.get("scan", {}).get("mode", "offers")
         print(f"Origins:            {len(origins)}  {origins[:6]}{'...' if len(origins)>6 else ''}")
         print(f"Destination groups: {len(destinations)}")
         print(f"Dest airports:      {total_dest}  "
               f"{[a for d in destinations for a in d['airports']][:8]}...")
         print(f"Date pairs:         {len(date_pairs)}")
-        print(f"Estimated calls:    {est}  (cap: {cap})")
-        if est > cap:
-            print("⚠️  Over cap — scan would be aborted. Reduce scope or raise limits.max_api_calls.")
+        print(f"Scan mode:          {mode}")
+        if mode == "dates":
+            top_n = cfg.get("limits", {}).get("dates_mode_top_n", 3)
+            pre_calls = len(origins) * total_dest
+            est_offers = pre_calls * top_n
+            print(f"Estimated calls     (dates pre-pass): {pre_calls}  + offers: ~{est_offers}"
+                  f"  total: ~{pre_calls + est_offers}  (vs offers-only: {est})")
         else:
-            print("✅ Within cap.")
+            print(f"Estimated calls:    {est}  (cap: {cap})")
+            if est > cap:
+                print("⚠️  Over cap — scan would be aborted. Reduce scope or raise limits.max_api_calls.")
+            else:
+                print("✅ Within cap.")
         return
 
+    # IMP-7: detect dates mode and build dates_fetcher
+    mode = cfg.get("scan", {}).get("mode", "offers")
+    dates_fetcher = None
     if args.demo:
         print("== DEMO MODE (synthetic prices, no API calls) ==\n")
         fetcher = make_demo_fetcher()
+        if mode == "dates":
+            dates_fetcher = make_demo_dates_fetcher()
     else:
         env = cfg.get("amadeus_env", "test")
         try:
@@ -862,12 +1178,29 @@ def main() -> None:
         except RuntimeError as e:
             sys.exit(f"Error: {e}")
         fetcher = client.cheapest_offer
+        if mode == "dates":
+            dates_fetcher = client.cheapest_dates
 
-    alerts = run_scan(cfg, conn, fetcher, origins, destinations)
+    # Capture scan start time for export query (IMP-10)
+    scan_start = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+
+    alerts = run_scan(cfg, conn, fetcher, origins, destinations, dates_fetcher=dates_fetcher)
+
     if alerts:
         notify(alerts, cfg, conn)  # IMP-3: pass conn for cooldown dedup
     else:
         print("No bargains this run (prices stored to history for future comparison).")
+
+    # IMP-10: export results if requested
+    if args.export:
+        cur = conn.execute(
+            "SELECT * FROM observations WHERE scanned_at >= ? ORDER BY price",
+            (scan_start,),
+        )
+        cols = [d[0] for d in cur.description]
+        obs_dicts = [dict(zip(cols, row)) for row in cur.fetchall()]
+        export_path = ROOT / f"scan_export_{scan_start[:10]}.{args.export}"
+        export_results(obs_dicts, export_path, args.export)
 
 
 if __name__ == "__main__":

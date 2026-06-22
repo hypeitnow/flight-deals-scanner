@@ -367,21 +367,23 @@ class TestBudget:
         result = fs.estimate_calls(origins, dests, dates)
         assert result == 3 * 4 * 2  # 24
 
-    def test_check_budget_within_cap(self, capsys):
-        fs.check_budget(100, {"max_api_calls": 500})
-        out = capsys.readouterr().out
-        assert "100" in out
+    def test_check_budget_within_cap(self, caplog):
+        import logging
+        with caplog.at_level(logging.INFO, logger="flight_scanner"):
+            fs.check_budget(100, {"max_api_calls": 500})
+        assert "100" in caplog.text
 
     def test_check_budget_over_cap_exits(self):
         with pytest.raises(SystemExit) as exc_info:
             fs.check_budget(999, {"max_api_calls": 100})
         assert "exceeds the cap" in str(exc_info.value)
 
-    def test_default_cap_is_500(self, capsys):
+    def test_default_cap_is_500(self, caplog):
+        import logging
         # Should not exit with 499 calls and no max_api_calls in limits
-        fs.check_budget(499, {})
-        out = capsys.readouterr().out
-        assert "499" in out
+        with caplog.at_level(logging.INFO, logger="flight_scanner"):
+            fs.check_budget(499, {})
+        assert "499" in caplog.text
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1196,3 +1198,438 @@ class TestAmadeusClientExtra:
         # Second call (flight-offers) URL should contain nonStop=true
         data_call_url = mock_urlopen.call_args_list[1][0][0].full_url
         assert "nonStop=true" in data_call_url
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# IMP-7: Cheapest-Date Search (AmadeusClient.cheapest_dates + dates mode)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestCheapestDatesMode:
+    TOKEN_RESP = {"access_token": "tok", "expires_in": 1799}
+    DATES_RESP = {
+        "data": [
+            {"departureDate": "2026-07-11", "returnDate": "2026-07-16",
+             "price": {"total": "280.00"}},
+            {"departureDate": "2026-08-01", "returnDate": "2026-08-06",
+             "price": {"total": "320.00"}},
+            {"departureDate": "2026-07-25", "returnDate": "2026-07-30",
+             "price": {"total": "260.00"}},
+        ]
+    }
+
+    @pytest.fixture(autouse=True)
+    def _set_env(self, monkeypatch):
+        monkeypatch.setenv("AMADEUS_CLIENT_ID", "k")
+        monkeypatch.setenv("AMADEUS_CLIENT_SECRET", "s")
+
+    def _ctx(self, data):
+        m = MagicMock()
+        m.__enter__ = MagicMock(return_value=io.BytesIO(json.dumps(data).encode()))
+        m.__exit__ = MagicMock(return_value=False)
+        return m
+
+    @patch("urllib.request.urlopen")
+    def test_cheapest_dates_parsing(self, mock_urlopen):
+        mock_urlopen.side_effect = [self._ctx(self.TOKEN_RESP), self._ctx(self.DATES_RESP)]
+        client = fs.AmadeusClient(env="test")
+        results = client.cheapest_dates("WAW", "TGD", "PLN", duration=5)
+        assert results[0]["price"] == pytest.approx(260.00)
+        assert results[0]["depart_date"] == "2026-07-25"
+        assert results[0]["return_date"] == "2026-07-30"
+        assert len(results) <= 5
+
+    @patch("urllib.request.urlopen")
+    def test_cheapest_dates_empty_response(self, mock_urlopen):
+        mock_urlopen.side_effect = [self._ctx(self.TOKEN_RESP), self._ctx({"data": []})]
+        client = fs.AmadeusClient(env="test")
+        assert client.cheapest_dates("WAW", "TGD", "PLN") == []
+
+    @patch("urllib.request.urlopen")
+    def test_cheapest_dates_uses_duration_param(self, mock_urlopen):
+        mock_urlopen.side_effect = [self._ctx(self.TOKEN_RESP), self._ctx(self.DATES_RESP)]
+        client = fs.AmadeusClient(env="test")
+        client.cheapest_dates("WAW", "TGD", "PLN", duration=7)
+        url = mock_urlopen.call_args_list[1][0][0].full_url
+        assert "duration=7" in url
+
+    @patch("urllib.request.urlopen")
+    def test_cheapest_dates_oneway_when_no_duration(self, mock_urlopen):
+        mock_urlopen.side_effect = [self._ctx(self.TOKEN_RESP), self._ctx(self.DATES_RESP)]
+        client = fs.AmadeusClient(env="test")
+        client.cheapest_dates("WAW", "TGD", "PLN")
+        url = mock_urlopen.call_args_list[1][0][0].full_url
+        assert "oneWay=true" in url
+
+    def test_dates_mode_demo_fetcher_returns_sorted_list(self):
+        fetcher = fs.make_demo_dates_fetcher()
+        results = fetcher("WAW", "TGD", "PLN", duration=5)
+        assert isinstance(results, list) and len(results) > 0
+        prices = [r["price"] for r in results]
+        assert prices == sorted(prices)
+
+    def test_dates_mode_demo_fetcher_deterministic(self):
+        fetcher = fs.make_demo_dates_fetcher()
+        r1 = fetcher("WAW", "TGD", "PLN", duration=5, max_results=3)
+        r2 = fetcher("WAW", "TGD", "PLN", duration=5, max_results=3)
+        assert r1 == r2
+
+    def test_dates_mode_scan_uses_fewer_tasks(self, airports):
+        cfg = {
+            "origins": ["WAW"],
+            "currency": "PLN",
+            "adults": 1,
+            "non_stop": False,
+            "max_offers_per_query": 5,
+            "scan": {
+                "date_from": "2026-07-04",
+                "date_to": "2026-09-30",
+                "weekdays": list(range(7)),
+                "trip_length_days": [5],
+                "max_dates_per_route": 8,
+                "mode": "dates",
+            },
+            "destinations": [{"country": "ME", "target_price": 99999}],
+            "limits": {"max_api_calls": 50000, "dates_mode_top_n": 2},
+            "bargain": {},
+            "notify": {},
+        }
+        origins, dests = fs.normalise_config(cfg, airports)
+        conn_d = fs.db_connect(Path(":memory:"))
+        fs.run_scan(cfg, conn_d, fs.make_demo_fetcher(), origins, dests,
+                    dates_fetcher=fs.make_demo_dates_fetcher())
+        count_dates = conn_d.execute("SELECT COUNT(*) FROM observations").fetchone()[0]
+
+        conn_o = fs.db_connect(Path(":memory:"))
+        cfg_o = {**cfg, "scan": {**cfg["scan"], "mode": "offers", "max_dates_per_route": 8}}
+        fs.run_scan(cfg_o, conn_o, fs.make_demo_fetcher(), origins, dests)
+        count_offers = conn_o.execute("SELECT COUNT(*) FROM observations").fetchone()[0]
+
+        assert count_dates <= count_offers
+
+    def test_dates_mode_fallback_on_error(self, conn, airports):
+        def failing_dates(*args, **kwargs):
+            raise RuntimeError("service unavailable")
+
+        cfg = {
+            "origins": ["WAW"],
+            "currency": "PLN",
+            "adults": 1,
+            "non_stop": False,
+            "max_offers_per_query": 5,
+            "scan": {
+                "date_from": "2026-07-04",
+                "date_to": "2026-07-31",
+                "weekdays": [4],
+                "trip_length_days": [3],
+                "max_dates_per_route": 2,
+                "mode": "dates",
+            },
+            "destinations": [{"country": "ME", "target_price": 99999}],
+            "limits": {"max_api_calls": 500},
+            "bargain": {},
+            "notify": {},
+        }
+        origins, dests = fs.normalise_config(cfg, airports)
+        alerts = fs.run_scan(cfg, conn, fs.make_demo_fetcher(), origins, dests,
+                             dates_fetcher=failing_dates)
+        assert isinstance(alerts, list)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# IMP-8: Return-leg metrics + stop/duration filters
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestReturnLegMetrics:
+    TOKEN_RESP = {"access_token": "tok", "expires_in": 1799}
+    ROUND_TRIP_RESP = {
+        "data": [{
+            "price": {"total": "300.00", "currency": "EUR"},
+            "validatingAirlineCodes": ["LO"],
+            "itineraries": [
+                {"duration": "PT2H30M", "segments": [{"numberOfStops": 0}]},
+                {"duration": "PT3H15M", "segments": [{"numberOfStops": 1}, {"numberOfStops": 0}]},
+            ],
+        }]
+    }
+    ONE_WAY_RESP = {
+        "data": [{
+            "price": {"total": "200.00", "currency": "EUR"},
+            "validatingAirlineCodes": ["FR"],
+            "itineraries": [{"duration": "PT1H45M", "segments": [{"numberOfStops": 0}]}],
+        }]
+    }
+
+    @pytest.fixture(autouse=True)
+    def _set_env(self, monkeypatch):
+        monkeypatch.setenv("AMADEUS_CLIENT_ID", "k")
+        monkeypatch.setenv("AMADEUS_CLIENT_SECRET", "s")
+
+    def _ctx(self, data):
+        m = MagicMock()
+        m.__enter__ = MagicMock(return_value=io.BytesIO(json.dumps(data).encode()))
+        m.__exit__ = MagicMock(return_value=False)
+        return m
+
+    @patch("urllib.request.urlopen")
+    def test_return_stops_captured(self, mock_urlopen):
+        mock_urlopen.side_effect = [self._ctx(self.TOKEN_RESP), self._ctx(self.ROUND_TRIP_RESP)]
+        client = fs.AmadeusClient(env="test")
+        result = client.cheapest_offer("WAW", "TGD", "2026-07-11", "2026-07-16", 1, "EUR", 5, False)
+        # inbound: 2 segments (1 connection) + 1 segment has 1 stop = 2 total stops
+        assert result["return_stops"] == 2
+        assert result["return_duration_min"] == 195  # PT3H15M
+
+    @patch("urllib.request.urlopen")
+    def test_return_stops_none_for_one_way(self, mock_urlopen):
+        mock_urlopen.side_effect = [self._ctx(self.TOKEN_RESP), self._ctx(self.ONE_WAY_RESP)]
+        client = fs.AmadeusClient(env="test")
+        result = client.cheapest_offer("WAW", "TGD", "2026-07-11", None, 1, "EUR", 5, False)
+        assert result["return_stops"] is None
+        assert result["return_duration_min"] is None
+
+    def test_return_metrics_stored_in_db(self, conn):
+        obs = {
+            "scanned_at": "2026-07-01T08:00:00+00:00",
+            "origin": "WAW", "destination": "TGD",
+            "depart_date": "2026-07-11", "return_date": "2026-07-16",
+            "price": 300.0, "currency": "EUR", "carriers": "LO",
+            "stops": 0, "duration_min": 150,
+            "return_stops": 1, "return_duration_min": 195,
+        }
+        fs.record_observation(conn, obs)
+        row = conn.execute(
+            "SELECT return_stops, return_duration_min FROM observations"
+        ).fetchone()
+        assert row[0] == 1
+        assert row[1] == 195
+
+    def test_max_stops_filter_excludes_offer(self, conn, airports):
+        cfg = {
+            "origins": ["WAW"],
+            "currency": "PLN",
+            "adults": 1,
+            "non_stop": False,
+            "max_offers_per_query": 5,
+            "scan": {
+                "date_from": "2026-07-04",
+                "date_to": "2026-07-31",
+                "weekdays": [4],
+                "trip_length_days": [3],
+                "max_dates_per_route": 2,
+                "max_stops": 0,
+            },
+            "destinations": [{"country": "ME", "target_price": 99999}],
+            "limits": {"max_api_calls": 500},
+            "bargain": {},
+            "notify": {},
+        }
+        origins, dests = fs.normalise_config(cfg, airports)
+        fs.run_scan(cfg, conn, fs.make_demo_fetcher(), origins, dests)
+        rows = conn.execute("SELECT DISTINCT stops FROM observations").fetchall()
+        assert all(r[0] == 0 for r in rows if r[0] is not None)
+
+    def test_max_duration_filter_excludes_offer(self, conn, airports):
+        def long_fetcher(origin, dest, depart, ret, adults, currency, max_offers, non_stop):
+            return {
+                "price": 300.0, "currency": currency, "carriers": "LO",
+                "stops": 0,
+                "duration_min": 500 if dest == "TGD" else 100,
+                "return_stops": None, "return_duration_min": None,
+            }
+
+        cfg = {
+            "origins": ["WAW"],
+            "currency": "PLN",
+            "adults": 1,
+            "non_stop": False,
+            "max_offers_per_query": 5,
+            "scan": {
+                "date_from": "2026-07-04",
+                "date_to": "2026-07-31",
+                "weekdays": [4],
+                "trip_length_days": [3],
+                "max_dates_per_route": 2,
+                "max_duration_min": 200,
+            },
+            "destinations": [{"country": "ME", "target_price": 99999}],
+            "limits": {"max_api_calls": 500},
+            "bargain": {},
+            "notify": {},
+        }
+        origins, dests = fs.normalise_config(cfg, airports)
+        fs.run_scan(cfg, conn, long_fetcher, origins, dests)
+        rows = conn.execute("SELECT destination FROM observations").fetchall()
+        stored = {r[0] for r in rows}
+        assert "TGD" not in stored
+        assert "TIV" in stored
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# IMP-9: Structured logging + run summary
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _logger_level() -> int:
+    import logging as _logging
+    return _logging.getLogger("flight_scanner").getEffectiveLevel()
+
+
+class TestLoggingAndSummary:
+    def test_setup_logging_verbose_sets_debug(self):
+        import logging as _logging
+        fs.setup_logging(verbose=True, quiet=False)
+        assert _logger_level() <= _logging.DEBUG
+        fs.setup_logging(verbose=False, quiet=False)
+
+    def test_setup_logging_quiet_sets_warning(self):
+        import logging as _logging
+        fs.setup_logging(verbose=False, quiet=True)
+        assert _logger_level() >= _logging.WARNING
+        fs.setup_logging(verbose=False, quiet=False)
+
+    def test_setup_logging_default_is_info(self):
+        import logging as _logging
+        fs.setup_logging()
+        assert _logger_level() == _logging.INFO
+
+    def test_run_summary_printed(self, conn, airports, capsys):
+        cfg = {
+            "origins": ["WAW"],
+            "currency": "PLN",
+            "adults": 1,
+            "non_stop": False,
+            "max_offers_per_query": 5,
+            "scan": {
+                "date_from": "2026-07-04",
+                "date_to": "2026-07-31",
+                "weekdays": [4],
+                "trip_length_days": [3],
+                "max_dates_per_route": 2,
+            },
+            "destinations": [{"country": "ME", "target_price": 99999}],
+            "limits": {"max_api_calls": 500},
+            "bargain": {},
+            "notify": {},
+        }
+        origins, dests = fs.normalise_config(cfg, airports)
+        fs.run_scan(cfg, conn, fs.make_demo_fetcher(), origins, dests)
+        out = capsys.readouterr().out
+        assert "Run summary" in out
+        assert "Routes scanned" in out
+        assert "API calls made" in out
+        assert "Alerts found" in out
+
+    def test_run_summary_shows_cheapest(self, conn, airports, capsys):
+        cfg = {
+            "origins": ["WAW"],
+            "currency": "PLN",
+            "adults": 1,
+            "non_stop": False,
+            "max_offers_per_query": 5,
+            "scan": {
+                "date_from": "2026-07-04",
+                "date_to": "2026-07-31",
+                "weekdays": [4],
+                "trip_length_days": [3],
+                "max_dates_per_route": 2,
+            },
+            "destinations": [{"country": "ME", "target_price": 99999}],
+            "limits": {"max_api_calls": 500},
+            "bargain": {},
+            "notify": {},
+        }
+        origins, dests = fs.normalise_config(cfg, airports)
+        fs.run_scan(cfg, conn, fs.make_demo_fetcher(), origins, dests)
+        out = capsys.readouterr().out
+        assert "Cheapest overall" in out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# IMP-10: Deep-links + export
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestDeeplinksAndExport:
+    OBS_RT = {
+        "origin": "WAW", "destination": "TGD",
+        "depart_date": "2026-07-11", "return_date": "2026-07-16",
+        "price": 280.0, "currency": "PLN",
+    }
+    OBS_OW = {
+        "origin": "WAW", "destination": "BCN",
+        "depart_date": "2026-08-01", "return_date": None,
+        "price": 350.0, "currency": "PLN",
+    }
+
+    def test_build_deeplinks_roundtrip(self):
+        links = fs.build_deeplinks(self.OBS_RT)
+        assert "kayak.com" in links["kayak"]
+        assert "WAW-TGD" in links["kayak"]
+        assert "2026-07-11" in links["kayak"]
+        assert "2026-07-16" in links["kayak"]
+        assert "skyscanner.net" in links["skyscanner"]
+        assert "waw" in links["skyscanner"]
+        assert "260711" in links["skyscanner"]
+        assert "260716" in links["skyscanner"]
+
+    def test_build_deeplinks_oneway(self):
+        links = fs.build_deeplinks(self.OBS_OW)
+        assert "BCN" in links["kayak"]
+        assert "2026-07-16" not in links["kayak"]
+        assert "260801" in links["skyscanner"]
+
+    def test_export_json(self, tmp_path):
+        obs_list = [{
+            **self.OBS_RT,
+            "scanned_at": "2026-07-11T08:00:00+00:00",
+            "carriers": "LO", "stops": 0, "duration_min": 130,
+            "return_stops": None, "return_duration_min": None, "id": 1,
+        }]
+        path = tmp_path / "out.json"
+        fs.export_results(obs_list, path, "json")
+        data = json.loads(path.read_text())
+        assert len(data) == 1
+        assert "deeplinks" in data[0]
+        assert "kayak" in data[0]["deeplinks"]
+
+    def test_export_csv(self, tmp_path):
+        import csv as _csv
+        obs_list = [{
+            **self.OBS_RT,
+            "scanned_at": "2026-07-11T08:00:00+00:00",
+            "carriers": "LO", "stops": 0, "duration_min": 130,
+            "return_stops": None, "return_duration_min": None, "id": 1,
+        }]
+        path = tmp_path / "out.csv"
+        fs.export_results(obs_list, path, "csv")
+        with path.open() as fh:
+            rows = list(_csv.DictReader(fh))
+        assert len(rows) == 1
+        assert "link_kayak" in rows[0]
+        assert "kayak.com" in rows[0]["link_kayak"]
+
+    def test_export_empty_noop(self, tmp_path, capsys):
+        path = tmp_path / "empty.json"
+        fs.export_results([], path, "json")
+        assert not path.exists()
+        assert "no observations" in capsys.readouterr().out
+
+    def test_notify_includes_deeplink_in_webhook(self):
+        alert = {
+            "origin": "WAW", "destination": "TGD",
+            "depart_date": "2026-07-11", "return_date": "2026-07-16",
+            "price": 280.0, "currency": "PLN",
+            "carriers": "LO", "stops": 0, "duration_min": 130,
+            "reason": "<= target 600",
+            "scanned_at": "2026-07-11T08:00:00+00:00",
+        }
+        mock_cm = MagicMock()
+        mock_cm.__enter__ = MagicMock(return_value=mock_cm)
+        mock_cm.__exit__ = MagicMock(return_value=False)
+        with patch("urllib.request.urlopen") as mock_uo:
+            mock_uo.return_value = mock_cm
+            cfg = {"notify": {
+                "telegram": {"enabled": False},
+                "webhook": {"enabled": True, "url": "https://hook.example.com"},
+            }}
+            fs.notify([alert], cfg)
+        payload = json.loads(mock_uo.call_args[0][0].data.decode())
+        assert "kayak" in payload["text"]

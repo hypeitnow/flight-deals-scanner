@@ -12,17 +12,26 @@
     "date_to": "2026-09-30",
     "weekdays": [4, 5],
     "trip_length_days": [5, 7],
-    "max_dates_per_route": 4
+    "max_dates_per_route": 4,
+
+    "_comment_mode": "Set 'mode' to 'dates' to use Amadeus flight-dates pre-pass (IMP-7) — fewer API calls",
+    "mode": "offers",
+
+    "_comment_filters": "Optional stop/duration filters (IMP-8): omit or set to null to disable",
+    "max_stops": null,
+    "max_duration_min": null
   },
 
   "destinations": [
-    { "country": "ME", "label": "Montenegro",          "target_price": 600 },
-    { "country": "BA", "label": "Bosnia & Herzegovina", "target_price": 650 },
-    { "country": "HR", "label": "Croatia",              "target_price": 500 }
+    { "country": "ME", "label": "Montenegro",           "target_price": 600 },
+    { "country": "BA", "label": "Bosnia & Herzegovina",  "target_price": 650 },
+    { "country": "HR", "label": "Croatia",               "target_price": 500 }
   ],
 
   "limits": {
-    "max_api_calls": 500
+    "max_api_calls": 500,
+    "_comment_monthly": "monthly_cap aborts scan when month-to-date calls would exceed limit (IMP-2)",
+    "dates_mode_top_n": 3
   },
 
   "bargain": {
@@ -33,6 +42,8 @@
 
   "notify": {
     "telegram": { "enabled": false, "bot_token": "", "chat_id": "" },
-    "webhook":  { "enabled": false, "url": "" }
+    "webhook":  { "enabled": false, "url": "" },
+    "_comment_cooldown": "cooldown_hours: suppress repeat notifications within N hours (IMP-3, default 24)",
+    "cooldown_hours": 24
   }
 }
