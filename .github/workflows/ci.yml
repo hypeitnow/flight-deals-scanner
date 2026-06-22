@@ -24,10 +24,10 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
-        run: pip install pytest
+        run: pip install pytest pytest-cov
 
-      - name: Run tests
-        run: python -m pytest tests/ -v --tb=short
+      - name: Run tests with coverage
+        run: python -m pytest tests/ -v --tb=short --cov=flight_scanner --cov-fail-under=85
 
   lint:
     name: Lint
@@ -46,6 +46,23 @@ jobs:
       - name: Lint with ruff
         run: ruff check flight_scanner.py tests/
 
+  typecheck:
+    name: Type check (mypy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install mypy
+        run: pip install mypy
+
+      - name: Run mypy
+        run: mypy flight_scanner.py --ignore-missing-imports --no-strict-optional
+
   demo:
     name: Demo smoke test
     runs-on: ubuntu-latest
@@ -62,3 +79,6 @@ jobs:
 
       - name: Run estimate (no API key needed)
         run: python flight_scanner.py --estimate
+
+      - name: Run quota (no API key needed)
+        run: python flight_scanner.py --quota

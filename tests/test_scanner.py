@@ -9,9 +9,15 @@ Run:
 from __future__ import annotations
 
 import datetime as dt
+import io
+import json
+import os
 import sqlite3
 import sys
+import time
+import urllib.error
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -614,3 +620,579 @@ class TestAirportsData:
             for iata in iatas:
                 assert isinstance(iata, str) and len(iata) == 3, \
                     f"{gname}: bad IATA '{iata}'"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# IMP-1: Per-route error isolation
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestRouteErrorIsolation:
+    """Fetcher exceptions must not abort the whole scan."""
+
+    _BASE_CFG = {
+        "origins": ["WAW"],
+        "currency": "PLN",
+        "adults": 1,
+        "non_stop": False,
+        "max_offers_per_query": 5,
+        "scan": {
+            "date_from": "2026-07-04",
+            "date_to": "2026-07-31",
+            "weekdays": [4],
+            "trip_length_days": [3],
+            "max_dates_per_route": 2,
+        },
+        "destinations": [{"country": "ME", "target_price": 99999}],
+        "limits": {"max_api_calls": 500},
+        "bargain": {},
+        "notify": {},
+    }
+
+    def test_failing_route_does_not_abort_scan(self, conn, airports):
+        call_count = [0]
+
+        def flaky_fetcher(origin, dest, depart, ret, adults, currency, max_offers, non_stop):
+            call_count[0] += 1
+            if dest == "TGD" and call_count[0] == 1:
+                raise RuntimeError("simulated network error")
+            return {"price": 400.0, "currency": currency,
+                    "carriers": "LO", "stops": 0, "duration_min": 130}
+
+        origins, dests = fs.normalise_config(self._BASE_CFG, airports)
+        alerts = fs.run_scan(self._BASE_CFG, conn, flaky_fetcher, origins, dests)
+        assert isinstance(alerts, list)
+        count = conn.execute("SELECT COUNT(*) FROM observations").fetchone()[0]
+        assert count > 0  # other routes still stored
+
+    def test_all_routes_fail_returns_empty(self, conn, airports):
+        def always_fails(*args, **kwargs):
+            raise RuntimeError("always fails")
+
+        origins, dests = fs.normalise_config(self._BASE_CFG, airports)
+        alerts = fs.run_scan(self._BASE_CFG, conn, always_fails, origins, dests)
+        assert alerts == []
+
+    def test_partial_failure_alerts_still_returned(self, conn, airports):
+        """Routes that succeed should still produce alerts."""
+        def partial_fetcher(origin, dest, depart, ret, adults, currency, max_offers, non_stop):
+            if dest == "TGD":
+                raise RuntimeError("TGD down")
+            return {"price": 100.0, "currency": currency,
+                    "carriers": "LO", "stops": 0, "duration_min": 90}
+
+        origins, dests = fs.normalise_config(self._BASE_CFG, airports)
+        alerts = fs.run_scan(self._BASE_CFG, conn, partial_fetcher, origins, dests)
+        # TIV succeeded with price 100 < target 99999 → bargain alert
+        assert len(alerts) > 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# IMP-2: Monthly quota tracking
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestMonthlyQuota:
+    def test_record_scan_run(self, conn):
+        fs.record_scan_run(conn, 42, 3)
+        total, runs = fs.monthly_usage(conn)
+        assert total == 42
+        assert len(runs) == 1
+        assert runs[0]["calls_made"] == 42
+        assert runs[0]["alerts"] == 3
+
+    def test_monthly_usage_accumulates(self, conn):
+        fs.record_scan_run(conn, 100, 2)
+        fs.record_scan_run(conn, 150, 0)
+        total, runs = fs.monthly_usage(conn)
+        assert total == 250
+        assert len(runs) == 2
+
+    def test_monthly_usage_empty(self, conn):
+        total, runs = fs.monthly_usage(conn)
+        assert total == 0
+        assert runs == []
+
+    def test_run_scan_records_calls(self, conn, airports):
+        cfg = {
+            "origins": ["WAW"],
+            "currency": "PLN",
+            "adults": 1,
+            "non_stop": False,
+            "max_offers_per_query": 5,
+            "scan": {
+                "date_from": "2026-07-04",
+                "date_to": "2026-07-31",
+                "weekdays": [4],
+                "trip_length_days": [3],
+                "max_dates_per_route": 2,
+            },
+            "destinations": [{"country": "ME"}],
+            "limits": {"max_api_calls": 500},
+            "bargain": {},
+            "notify": {},
+        }
+        origins, dests = fs.normalise_config(cfg, airports)
+        fs.run_scan(cfg, conn, fs.make_demo_fetcher(), origins, dests)
+        total, runs = fs.monthly_usage(conn)
+        assert total > 0
+        assert len(runs) == 1
+
+    def test_monthly_cap_aborts_scan(self, conn, airports):
+        # Record 50 calls already used, then set monthly_cap=50 → any new scan should abort
+        fs.record_scan_run(conn, 50, 0)
+        cfg = {
+            "origins": ["WAW"],
+            "currency": "PLN",
+            "adults": 1,
+            "non_stop": False,
+            "max_offers_per_query": 5,
+            "scan": {
+                "date_from": "2026-07-04",
+                "date_to": "2026-07-31",
+                "weekdays": list(range(7)),
+                "trip_length_days": [3],
+                "max_dates_per_route": 8,
+            },
+            "destinations": [{"country": "ME"}],
+            "limits": {"max_api_calls": 5000, "monthly_cap": 50},
+            "bargain": {},
+            "notify": {},
+        }
+        origins, dests = fs.normalise_config(cfg, airports)
+        with pytest.raises(SystemExit, match="monthly cap"):
+            fs.run_scan(cfg, conn, fs.make_demo_fetcher(), origins, dests)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# IMP-3: Notification dedup / cooldown
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestNotificationDedup:
+    ALERT = {
+        "origin": "WAW", "destination": "TGD",
+        "depart_date": "2026-07-11", "return_date": "2026-07-14",
+        "price": 300.0, "currency": "PLN",
+        "carriers": "LO", "stops": 0, "duration_min": 130,
+        "reason": "<= target 600",
+        "scanned_at": "2026-07-01T08:00:00+00:00",
+    }
+
+    def test_first_alert_should_notify(self, conn):
+        assert fs.should_notify_alert(conn, self.ALERT, 24) is True
+
+    def test_same_alert_suppressed_within_cooldown(self, conn):
+        fs.record_sent_alert(conn, self.ALERT)
+        assert fs.should_notify_alert(conn, self.ALERT, 24) is False
+
+    def test_price_improvement_overrides_cooldown(self, conn):
+        fs.record_sent_alert(conn, self.ALERT)
+        better = {**self.ALERT, "price": 280.0}  # 280 < 300*0.95=285 → re-alert ✓
+        assert fs.should_notify_alert(conn, better, 24) is True
+
+    def test_small_price_change_still_suppressed(self, conn):
+        fs.record_sent_alert(conn, self.ALERT)
+        slightly_better = {**self.ALERT, "price": 290.0}  # 290 > 300*0.95=285 → suppressed
+        assert fs.should_notify_alert(conn, slightly_better, 24) is False
+
+    def test_expired_cooldown_notifies_again(self, conn):
+        fs.record_sent_alert(conn, self.ALERT)
+        # -1 hour cooldown → expired immediately
+        assert fs.should_notify_alert(conn, self.ALERT, -1) is True
+
+    def test_different_route_not_suppressed(self, conn):
+        fs.record_sent_alert(conn, self.ALERT)
+        different = {**self.ALERT, "destination": "TIV"}
+        assert fs.should_notify_alert(conn, different, 24) is True
+
+    def test_different_dates_not_suppressed(self, conn):
+        fs.record_sent_alert(conn, self.ALERT)
+        different_dates = {**self.ALERT, "depart_date": "2026-08-01", "return_date": "2026-08-04"}
+        assert fs.should_notify_alert(conn, different_dates, 24) is True
+
+    def test_record_sent_alert_persists(self, conn):
+        fs.record_sent_alert(conn, self.ALERT)
+        row = conn.execute("SELECT COUNT(*) FROM sent_alerts").fetchone()[0]
+        assert row == 1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# IMP-4: AmadeusClient mock-HTTP tests
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestAmadeusClient:
+    """AmadeusClient tested without real HTTP calls via unittest.mock."""
+
+    TOKEN_RESP = {
+        "access_token": "test_token_abc",
+        "expires_in": 1799,
+        "token_type": "Bearer",
+    }
+    OFFERS_RESP = {
+        "data": [{
+            "price": {"total": "345.20", "currency": "EUR"},
+            "validatingAirlineCodes": ["LO", "FR"],
+            "itineraries": [{
+                "duration": "PT2H30M",
+                "segments": [{"numberOfStops": 0}, {"numberOfStops": 0}],
+            }],
+        }]
+    }
+
+    @pytest.fixture(autouse=True)
+    def _set_env(self, monkeypatch):
+        monkeypatch.setenv("AMADEUS_CLIENT_ID", "test_key")
+        monkeypatch.setenv("AMADEUS_CLIENT_SECRET", "test_secret")
+
+    def _ctx(self, data: dict):
+        """Wrap a dict in a mock context manager that json.load can read."""
+        mock_cm = MagicMock()
+        mock_cm.__enter__ = MagicMock(return_value=io.BytesIO(json.dumps(data).encode()))
+        mock_cm.__exit__ = MagicMock(return_value=False)
+        return mock_cm
+
+    def _http_err(self, code: int):
+        return urllib.error.HTTPError("url", code, f"HTTP {code}", {}, io.BytesIO(b"err"))
+
+    @patch("urllib.request.urlopen")
+    def test_initial_auth(self, mock_urlopen):
+        mock_urlopen.side_effect = [self._ctx(self.TOKEN_RESP), self._ctx(self.OFFERS_RESP)]
+        client = fs.AmadeusClient(env="test")
+        client._get("/v2/shopping/flight-offers", {})
+        assert mock_urlopen.call_count == 2  # 1 auth + 1 data
+        assert client._token == "test_token_abc"
+
+    @patch("urllib.request.urlopen")
+    def test_token_cached_across_calls(self, mock_urlopen):
+        mock_urlopen.side_effect = [
+            self._ctx(self.TOKEN_RESP),
+            self._ctx(self.OFFERS_RESP),
+            self._ctx(self.OFFERS_RESP),
+        ]
+        client = fs.AmadeusClient(env="test")
+        client._get("/v2/shopping/flight-offers", {})
+        client._get("/v2/shopping/flight-offers", {})
+        assert mock_urlopen.call_count == 3  # 1 auth + 2 data
+
+    @patch("urllib.request.urlopen")
+    def test_token_refreshed_on_expiry(self, mock_urlopen):
+        mock_urlopen.side_effect = [
+            self._ctx(self.TOKEN_RESP), self._ctx(self.OFFERS_RESP),
+            self._ctx(self.TOKEN_RESP), self._ctx(self.OFFERS_RESP),
+        ]
+        client = fs.AmadeusClient(env="test")
+        client._get("/v2/shopping/flight-offers", {})
+        client._token_expiry = time.time() - 1  # force expiry
+        client._get("/v2/shopping/flight-offers", {})
+        assert mock_urlopen.call_count == 4  # 2 auth + 2 data
+
+    @patch("time.sleep")
+    @patch("urllib.request.urlopen")
+    def test_429_retry_with_backoff(self, mock_urlopen, mock_sleep):
+        mock_urlopen.side_effect = [
+            self._ctx(self.TOKEN_RESP),
+            self._http_err(429),
+            self._ctx(self.OFFERS_RESP),
+        ]
+        client = fs.AmadeusClient(env="test")
+        result = client._get("/v2/shopping/flight-offers", {})
+        assert result == self.OFFERS_RESP
+        mock_sleep.assert_called_once_with(1)  # 2**0
+
+    @patch("time.sleep")
+    @patch("urllib.request.urlopen")
+    def test_repeated_429_raises(self, mock_urlopen, mock_sleep):
+        mock_urlopen.side_effect = [self._ctx(self.TOKEN_RESP)] + [self._http_err(429)] * 4
+        client = fs.AmadeusClient(env="test")
+        with pytest.raises(RuntimeError, match="rate-limit"):
+            client._get("/v2/shopping/flight-offers", {})
+
+    @patch("urllib.request.urlopen")
+    def test_401_triggers_reauth(self, mock_urlopen):
+        mock_urlopen.side_effect = [
+            self._ctx(self.TOKEN_RESP),  # initial auth
+            self._http_err(401),          # request fails
+            self._ctx(self.TOKEN_RESP),  # re-auth
+            self._ctx(self.OFFERS_RESP), # retry succeeds
+        ]
+        client = fs.AmadeusClient(env="test")
+        result = client._get("/v2/shopping/flight-offers", {})
+        assert result == self.OFFERS_RESP
+        assert mock_urlopen.call_count == 4
+
+    @patch("urllib.request.urlopen")
+    def test_5xx_raises_runtime_error(self, mock_urlopen):
+        mock_urlopen.side_effect = [self._ctx(self.TOKEN_RESP), self._http_err(500)]
+        client = fs.AmadeusClient(env="test")
+        with pytest.raises(RuntimeError, match="500"):
+            client._get("/v2/shopping/flight-offers", {})
+
+    @patch("urllib.request.urlopen")
+    def test_cheapest_offer_parsing(self, mock_urlopen):
+        mock_urlopen.side_effect = [self._ctx(self.TOKEN_RESP), self._ctx(self.OFFERS_RESP)]
+        client = fs.AmadeusClient(env="test")
+        result = client.cheapest_offer("WAW", "TGD", "2026-07-11", "2026-07-14", 1, "EUR", 5, False)
+        assert result["price"] == pytest.approx(345.20)
+        assert "LO" in result["carriers"]
+        assert result["stops"] == 1        # 2 segments → 1 connection
+        assert result["duration_min"] == 150  # PT2H30M
+
+    @patch("urllib.request.urlopen")
+    def test_cheapest_offer_no_data_returns_none(self, mock_urlopen):
+        mock_urlopen.side_effect = [self._ctx(self.TOKEN_RESP), self._ctx({"data": []})]
+        client = fs.AmadeusClient(env="test")
+        result = client.cheapest_offer("WAW", "TGD", "2026-07-11", None, 1, "EUR", 5, False)
+        assert result is None
+
+    @patch("urllib.request.urlopen")
+    def test_cheapest_offer_selects_min_price(self, mock_urlopen):
+        multi = {
+            "data": [
+                {"price": {"total": "500.00", "currency": "EUR"},
+                 "validatingAirlineCodes": ["LO"],
+                 "itineraries": [{"duration": "PT2H", "segments": [{"numberOfStops": 0}]}]},
+                {"price": {"total": "300.00", "currency": "EUR"},
+                 "validatingAirlineCodes": ["FR"],
+                 "itineraries": [{"duration": "PT3H", "segments": [{"numberOfStops": 1}]}]},
+            ]
+        }
+        mock_urlopen.side_effect = [self._ctx(self.TOKEN_RESP), self._ctx(multi)]
+        client = fs.AmadeusClient(env="test")
+        result = client.cheapest_offer("WAW", "TGD", "2026-07-11", None, 1, "EUR", 5, False)
+        assert result["price"] == pytest.approx(300.00)
+        assert "FR" in result["carriers"]
+
+    def test_missing_credentials_raises(self, monkeypatch):
+        monkeypatch.delenv("AMADEUS_CLIENT_ID", raising=False)
+        monkeypatch.delenv("AMADEUS_CLIENT_SECRET", raising=False)
+        with pytest.raises(RuntimeError, match="Missing AMADEUS"):
+            fs.AmadeusClient(env="test")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# IMP-6: Concurrent scanning
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestConcurrentScan:
+    _CFG = {
+        "origins": ["WAW", "KRK"],
+        "currency": "PLN",
+        "adults": 1,
+        "non_stop": False,
+        "max_offers_per_query": 5,
+        "scan": {
+            "date_from": "2026-07-04",
+            "date_to": "2026-07-31",
+            "weekdays": [4],
+            "trip_length_days": [3],
+            "max_dates_per_route": 2,
+        },
+        "destinations": [{"country": "ME", "target_price": 99999}],
+        "limits": {"max_api_calls": 500, "max_workers": 4},
+        "bargain": {"percentile": 25, "min_history": 50},
+        "notify": {},
+    }
+
+    def test_same_observation_count_on_repeated_runs(self, airports):
+        """Concurrent runs with demo fetcher produce consistent observation counts."""
+        origins, dests = fs.normalise_config(self._CFG, airports)
+        conn1 = fs.db_connect(Path(":memory:"))
+        fs.run_scan(self._CFG, conn1, fs.make_demo_fetcher(), origins, dests)
+        count1 = conn1.execute("SELECT COUNT(*) FROM observations").fetchone()[0]
+
+        conn2 = fs.db_connect(Path(":memory:"))
+        fs.run_scan(self._CFG, conn2, fs.make_demo_fetcher(), origins, dests)
+        count2 = conn2.execute("SELECT COUNT(*) FROM observations").fetchone()[0]
+        assert count1 == count2
+
+    def test_demo_fetcher_deterministic_by_input(self):
+        """Same inputs always produce the same price and stops."""
+        f = fs.make_demo_fetcher()
+        r1 = f("WAW", "TGD", "2026-07-11", "2026-07-14", 1, "PLN", 5, False)
+        r2 = f("WAW", "TGD", "2026-07-11", "2026-07-14", 1, "PLN", 5, False)
+        assert r1["price"] == r2["price"]
+        assert r1["stops"] == r2["stops"]
+
+    def test_different_inputs_different_prices(self):
+        """Different routes produce different prices (hash diversity)."""
+        f = fs.make_demo_fetcher()
+        r1 = f("WAW", "TGD", "2026-07-04", "2026-07-07", 1, "PLN", 5, False)
+        r2 = f("KRK", "TIV", "2026-07-11", "2026-07-14", 1, "PLN", 5, False)
+        # Very unlikely to collide across different route+date combos
+        assert r1["price"] != r2["price"] or r1["stops"] != r2["stops"]
+
+    def test_max_workers_config_respected(self, conn, airports):
+        """Scan with max_workers=1 produces same alerts as max_workers=8."""
+        origins, dests = fs.normalise_config(self._CFG, airports)
+        cfg1 = {**self._CFG, "limits": {**self._CFG["limits"], "max_workers": 1}}
+        cfg8 = {**self._CFG, "limits": {**self._CFG["limits"], "max_workers": 8}}
+        conn1 = fs.db_connect(Path(":memory:"))
+        conn8 = fs.db_connect(Path(":memory:"))
+        alerts1 = fs.run_scan(cfg1, conn1, fs.make_demo_fetcher(), origins, dests)
+        alerts8 = fs.run_scan(cfg8, conn8, fs.make_demo_fetcher(), origins, dests)
+        assert len(alerts1) == len(alerts8)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Notify function (IMP-3 paths + channel branches)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestNotify:
+    _ALERT = {
+        "origin": "WAW", "destination": "TGD",
+        "depart_date": "2026-07-11", "return_date": "2026-07-14",
+        "price": 300.0, "currency": "PLN",
+        "carriers": "LO", "stops": 0, "duration_min": 130,
+        "reason": "<= target 600",
+        "scanned_at": "2026-07-01T08:00:00+00:00",
+    }
+    _CFG_NONE = {"notify": {"telegram": {"enabled": False}, "webhook": {"enabled": False}}}
+
+    def test_empty_alerts_noop(self, capsys):
+        fs.notify([], self._CFG_NONE)
+        assert capsys.readouterr().out == ""
+
+    def test_no_channel_prints_nothing(self, capsys):
+        """Both channels disabled → no output (no channel = no notify)."""
+        fs.notify([self._ALERT], self._CFG_NONE)
+        assert capsys.readouterr().out == ""
+
+    def test_cooldown_suppresses_all(self, conn, capsys):
+        """When all alerts are suppressed by cooldown, prints suppression message."""
+        fs.record_sent_alert(conn, self._ALERT)
+        cfg = {"notify": {"telegram": {"enabled": True, "bot_token": "tok", "chat_id": "123"},
+                          "cooldown_hours": 24}}
+        with patch("urllib.request.urlopen") as mock_urlopen:
+            mock_urlopen.side_effect = Exception("should not be called")
+            fs.notify([self._ALERT], cfg, conn)
+        out = capsys.readouterr().out
+        assert "suppressed by cooldown" in out
+
+    @patch("urllib.request.urlopen")
+    def test_telegram_success(self, mock_urlopen, conn, capsys):
+        mock_cm = MagicMock()
+        mock_cm.__enter__ = MagicMock(return_value=mock_cm)
+        mock_cm.__exit__ = MagicMock(return_value=False)
+        mock_urlopen.return_value = mock_cm
+        cfg = {"notify": {"telegram": {"enabled": True, "bot_token": "tok", "chat_id": "123"},
+                          "webhook": {"enabled": False}}}
+        fs.notify([self._ALERT], cfg, conn)
+        assert "sent Telegram notification" in capsys.readouterr().out
+        assert mock_urlopen.called
+
+    @patch("urllib.request.urlopen")
+    def test_telegram_failure_logged(self, mock_urlopen, conn, capsys):
+        mock_urlopen.side_effect = Exception("network error")
+        cfg = {"notify": {"telegram": {"enabled": True, "bot_token": "tok", "chat_id": "123"},
+                          "webhook": {"enabled": False}}}
+        fs.notify([self._ALERT], cfg, conn)
+        assert "telegram failed" in capsys.readouterr().out
+
+    @patch("urllib.request.urlopen")
+    def test_webhook_success(self, mock_urlopen, conn, capsys):
+        mock_cm = MagicMock()
+        mock_cm.__enter__ = MagicMock(return_value=mock_cm)
+        mock_cm.__exit__ = MagicMock(return_value=False)
+        mock_urlopen.return_value = mock_cm
+        cfg = {"notify": {"telegram": {"enabled": False},
+                          "webhook": {"enabled": True, "url": "https://hook.example.com"}}}
+        fs.notify([self._ALERT], cfg, conn)
+        assert "webhook notification sent" in capsys.readouterr().out
+
+    @patch("urllib.request.urlopen")
+    def test_webhook_failure_logged(self, mock_urlopen, conn, capsys):
+        mock_urlopen.side_effect = Exception("timeout")
+        cfg = {"notify": {"telegram": {"enabled": False},
+                          "webhook": {"enabled": True, "url": "https://hook.example.com"}}}
+        fs.notify([self._ALERT], cfg, conn)
+        assert "webhook failed" in capsys.readouterr().out
+
+    def test_one_way_alert_formatted(self, capsys):
+        """Alerts with return_date=None should render '(one-way)'."""
+        one_way = {**self._ALERT, "return_date": None, "stops": None}
+        fs.notify([one_way], self._CFG_NONE)
+        # No channel → no output, but shouldn't crash
+        capsys.readouterr()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Loaders and show_history
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestLoaders:
+    def test_load_env_parses_file(self, tmp_path, monkeypatch):
+        env_file = tmp_path / ".env"
+        env_file.write_text('AMADEUS_CLIENT_ID="mykey"\nAMADEUS_CLIENT_SECRET=mysecret\n# comment\n')
+        monkeypatch.delenv("AMADEUS_CLIENT_ID", raising=False)
+        monkeypatch.delenv("AMADEUS_CLIENT_SECRET", raising=False)
+        fs.load_env(env_file)
+        assert os.environ["AMADEUS_CLIENT_ID"] == "mykey"
+        assert os.environ["AMADEUS_CLIENT_SECRET"] == "mysecret"
+
+    def test_load_env_missing_file_noop(self, tmp_path):
+        fs.load_env(tmp_path / "nonexistent.env")  # should not raise
+
+    def test_load_config_parses_json(self, tmp_path):
+        cfg_file = tmp_path / "config.json"
+        cfg_file.write_text('{"key": "value"}')
+        assert fs.load_config(cfg_file) == {"key": "value"}
+
+    def test_load_config_missing_exits(self, tmp_path):
+        with pytest.raises(SystemExit):
+            fs.load_config(tmp_path / "missing.json")
+
+    def test_load_airports_missing_exits(self, tmp_path):
+        with pytest.raises(SystemExit):
+            fs.load_airports(tmp_path / "missing.json")
+
+
+class TestShowHistory:
+    def test_empty_db(self, conn, capsys):
+        fs.show_history(conn)
+        assert "No observations" in capsys.readouterr().out
+
+    def test_with_observations(self, conn, capsys):
+        fs.record_observation(conn, {
+            "scanned_at": "2026-07-01T08:00:00+00:00",
+            "origin": "WAW", "destination": "TGD",
+            "depart_date": "2026-07-11", "return_date": "2026-07-14",
+            "price": 320.0, "currency": "PLN",
+            "carriers": "LO", "stops": 0, "duration_min": 130,
+        })
+        fs.show_history(conn)
+        out = capsys.readouterr().out
+        assert "WAW->TGD" in out
+        assert "320" in out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Additional AmadeusClient coverage
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestAmadeusClientExtra:
+    TOKEN_RESP = {"access_token": "tok", "expires_in": 1799}
+    OFFERS_RESP = {
+        "data": [{
+            "price": {"total": "200.00", "currency": "EUR"},
+            "validatingAirlineCodes": ["LO"],
+            "itineraries": [{"duration": "PT1H", "segments": [{"numberOfStops": 0}]}],
+        }]
+    }
+
+    @pytest.fixture(autouse=True)
+    def _set_env(self, monkeypatch):
+        monkeypatch.setenv("AMADEUS_CLIENT_ID", "k")
+        monkeypatch.setenv("AMADEUS_CLIENT_SECRET", "s")
+
+    def _ctx(self, data):
+        m = MagicMock()
+        m.__enter__ = MagicMock(return_value=io.BytesIO(json.dumps(data).encode()))
+        m.__exit__ = MagicMock(return_value=False)
+        return m
+
+    @patch("urllib.request.urlopen")
+    def test_non_stop_param_included(self, mock_urlopen):
+        mock_urlopen.side_effect = [self._ctx(self.TOKEN_RESP), self._ctx(self.OFFERS_RESP)]
+        client = fs.AmadeusClient(env="test")
+        client.cheapest_offer("WAW", "TGD", "2026-07-11", None, 1, "EUR", 5, True)
+        # Second call (flight-offers) URL should contain nonStop=true
+        data_call_url = mock_urlopen.call_args_list[1][0][0].full_url
+        assert "nonStop=true" in data_call_url

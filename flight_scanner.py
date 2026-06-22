@@ -21,15 +21,18 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import os
 import re
 import sqlite3
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 ROOT        = Path(__file__).resolve().parent
@@ -194,6 +197,36 @@ def db_connect(path: Path = DB_PATH) -> sqlite3.Connection:
         "CREATE INDEX IF NOT EXISTS idx_route ON observations "
         "(origin, destination, depart_date, return_date)"
     )
+    # IMP-2: monthly quota tracking
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS scan_runs (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_at     TEXT NOT NULL,
+            calls_made INTEGER NOT NULL DEFAULT 0,
+            alerts     INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    # IMP-3: notification dedup / cooldown
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sent_alerts (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            sent_at        TEXT NOT NULL,
+            origin         TEXT NOT NULL,
+            destination    TEXT NOT NULL,
+            depart_date    TEXT NOT NULL,
+            return_date    TEXT,
+            price_bucket   INTEGER NOT NULL,
+            notified_price REAL NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sent ON sent_alerts "
+        "(origin, destination, depart_date, return_date, sent_at)"
+    )
     conn.commit()
     return conn
 
@@ -238,6 +271,75 @@ def percentile(values: list[float], pct: float) -> float | None:
 
 
 # --------------------------------------------------------------------------- #
+# IMP-2: Monthly quota tracking
+# --------------------------------------------------------------------------- #
+def record_scan_run(conn: sqlite3.Connection, calls_made: int, alerts: int) -> None:
+    conn.execute(
+        "INSERT INTO scan_runs (run_at, calls_made, alerts) VALUES (?,?,?)",
+        (dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"), calls_made, alerts),
+    )
+    conn.commit()
+
+
+def monthly_usage(conn: sqlite3.Connection) -> tuple[int, list[dict]]:
+    """Return (total_calls_this_month, list_of_run_dicts)."""
+    first_of_month = dt.date.today().replace(day=1).isoformat()
+    cur = conn.execute(
+        "SELECT run_at, calls_made, alerts FROM scan_runs WHERE run_at >= ? ORDER BY run_at",
+        (first_of_month,),
+    )
+    rows = [{"run_at": r[0], "calls_made": r[1], "alerts": r[2]} for r in cur.fetchall()]
+    return sum(r["calls_made"] for r in rows), rows
+
+
+# --------------------------------------------------------------------------- #
+# IMP-3: Notification dedup / cooldown
+# --------------------------------------------------------------------------- #
+def should_notify_alert(
+    conn: sqlite3.Connection, alert: dict, cooldown_hours: float
+) -> bool:
+    """Return True if this alert should trigger a notification.
+
+    Suppressed within cooldown_hours of a previous notification for the same
+    route+dates, unless price improved by > 5 %.
+    """
+    cutoff = (
+        dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=cooldown_hours)
+    ).isoformat(timespec="seconds")
+    row = conn.execute(
+        """SELECT notified_price FROM sent_alerts
+           WHERE origin=? AND destination=? AND depart_date=?
+             AND IFNULL(return_date,'') = IFNULL(?, '')
+             AND sent_at > ?
+           ORDER BY sent_at DESC LIMIT 1""",
+        (
+            alert["origin"], alert["destination"], alert["depart_date"],
+            alert.get("return_date"), cutoff,
+        ),
+    ).fetchone()
+    if row is None:
+        return True  # no recent notification → send
+    # Re-alert if price dropped > 5 % from the last notified price
+    return float(alert["price"]) < row[0] * 0.95
+
+
+def record_sent_alert(conn: sqlite3.Connection, alert: dict) -> None:
+    bucket = int(alert["price"] / 50) * 50
+    conn.execute(
+        """INSERT INTO sent_alerts
+           (sent_at, origin, destination, depart_date, return_date,
+            price_bucket, notified_price)
+           VALUES (?,?,?,?,?,?,?)""",
+        (
+            dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+            alert["origin"], alert["destination"], alert["depart_date"],
+            alert.get("return_date"), bucket, alert["price"],
+        ),
+    )
+    conn.commit()
+
+
+# --------------------------------------------------------------------------- #
 # Amadeus API client  (FLIGHT-3: stops + duration)
 # --------------------------------------------------------------------------- #
 def _parse_iso_duration(s: str) -> int:
@@ -255,6 +357,7 @@ class AmadeusClient:
         self.secret = os.environ.get("AMADEUS_CLIENT_SECRET")
         self._token: str | None = None
         self._token_expiry = 0.0
+        self._lock = threading.Lock()  # IMP-6: thread-safe token refresh
         if not self.key or not self.secret:
             raise RuntimeError(
                 "Missing AMADEUS_CLIENT_ID / AMADEUS_CLIENT_SECRET. "
@@ -265,19 +368,22 @@ class AmadeusClient:
         return self._token is not None and time.time() < self._token_expiry - 30
 
     def _authenticate(self) -> None:
-        data = urllib.parse.urlencode(
-            {"grant_type": "client_credentials",
-             "client_id": self.key,
-             "client_secret": self.secret}
-        ).encode()
-        req = urllib.request.Request(
-            f"{self.base}/v1/security/oauth2/token", data=data,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-        )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            payload = json.load(resp)
-        self._token = payload["access_token"]
-        self._token_expiry = time.time() + payload.get("expires_in", 1799)
+        with self._lock:
+            if self._token_valid():  # double-check: another thread may have refreshed
+                return
+            data = urllib.parse.urlencode(
+                {"grant_type": "client_credentials",
+                 "client_id": self.key,
+                 "client_secret": self.secret}
+            ).encode()
+            req = urllib.request.Request(
+                f"{self.base}/v1/security/oauth2/token", data=data,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                payload = json.load(resp)
+            self._token = payload["access_token"]
+            self._token_expiry = time.time() + payload.get("expires_in", 1799)
 
     def _get(self, path: str, params: dict) -> dict:
         if not self._token_valid():
@@ -293,6 +399,7 @@ class AmadeusClient:
                     time.sleep(2 ** attempt)
                     continue
                 if e.code == 401:
+                    self._token = None  # invalidate so _authenticate proceeds
                     self._authenticate()
                     req.add_unredirected_header("Authorization", f"Bearer {self._token}")
                     continue
@@ -405,11 +512,26 @@ def evaluate_bargain(price, target_price, history, rules) -> tuple[bool, str]:
 # --------------------------------------------------------------------------- #
 # Notification
 # --------------------------------------------------------------------------- #
-def notify(alerts: list[dict], cfg: dict) -> None:
+def notify(alerts: list[dict], cfg: dict, conn: sqlite3.Connection | None = None) -> None:
     if not alerts:
         return
+
+    tg   = cfg.get("notify", {}).get("telegram", {})
+    hook = cfg.get("notify", {}).get("webhook", {})
+    has_channel = tg.get("enabled") or (hook.get("enabled") and hook.get("url"))
+
+    # IMP-3: cooldown dedup — only filter when a real channel is configured
+    if has_channel and conn is not None:
+        cooldown = cfg.get("notify", {}).get("cooldown_hours", 24)
+        to_notify = [a for a in alerts if should_notify_alert(conn, a, cooldown)]
+        if not to_notify:
+            print("  (all alerts suppressed by cooldown — no new notifications)")
+            return
+    else:
+        to_notify = alerts
+
     lines = ["✈️  BARGAIN ALERTS", "=" * 70]
-    for a in alerts:
+    for a in to_notify:
         route = f"{a['origin']}->{a['destination']}"
         dates = a["depart_date"] + (f"..{a['return_date']}" if a["return_date"] else " (one-way)")
         stops_str = ("direct" if a.get("stops") == 0
@@ -420,19 +542,23 @@ def notify(alerts: list[dict], cfg: dict) -> None:
         )
     message = "\n".join(lines)
 
-    tg = cfg.get("notify", {}).get("telegram", {})
     if tg.get("enabled"):
         try:
             _post_telegram(tg, message)
             print("  (sent Telegram notification)")
+            if conn is not None:
+                for a in to_notify:
+                    record_sent_alert(conn, a)
         except Exception as e:
             print(f"  (telegram failed: {e})")
 
-    hook = cfg.get("notify", {}).get("webhook", {})
     if hook.get("enabled") and hook.get("url"):
         try:
-            _post_webhook(hook["url"], {"text": message, "alerts": alerts})
+            _post_webhook(hook["url"], {"text": message, "alerts": to_notify})
             print("  (webhook notification sent)")
+            if conn is not None:
+                for a in to_notify:
+                    record_sent_alert(conn, a)
         except Exception as e:
             print(f"  (webhook failed: {e})")
 
@@ -458,75 +584,119 @@ def _post_webhook(url: str, payload: dict) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Scan  (FLIGHT-2: multi-origin; FLIGHT-4: country-level aggregation)
+# Scan  (IMP-1: error isolation; IMP-2: quota tracking; IMP-6: concurrent)
 # --------------------------------------------------------------------------- #
 def run_scan(cfg: dict, conn, fetcher, origins: list[str], destinations: list[dict]) -> list[dict]:
-    currency   = cfg.get("currency", "EUR")
-    adults     = cfg.get("adults", 1)
-    non_stop   = cfg.get("non_stop", False)
-    max_offers = cfg.get("max_offers_per_query", 5)
-    rules      = cfg.get("bargain", {})
-    limits     = cfg.get("limits", {})
-    date_pairs = generate_date_pairs(cfg["scan"])
-    now        = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+    currency    = cfg.get("currency", "EUR")
+    adults      = cfg.get("adults", 1)
+    non_stop    = cfg.get("non_stop", False)
+    max_offers  = cfg.get("max_offers_per_query", 5)
+    rules       = cfg.get("bargain", {})
+    limits      = cfg.get("limits", {})
+    max_workers = limits.get("max_workers", 4)
+    date_pairs  = generate_date_pairs(cfg["scan"])
+    now         = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
 
-    estimated = estimate_calls(origins, destinations, date_pairs)
-    print(f"Scanning {len(origins)} origin(s) × {sum(len(d['airports']) for d in destinations)}"
+    total_dest = sum(len(d["airports"]) for d in destinations)
+    estimated  = estimate_calls(origins, destinations, date_pairs)
+    print(f"Scanning {len(origins)} origin(s) × {total_dest}"
           f" dest airport(s) × {len(date_pairs)} date(s)")
+
+    # IMP-2: monthly quota check
+    if "monthly_cap" in limits:
+        month_used, _ = monthly_usage(conn)
+        remaining = limits["monthly_cap"] - month_used
+        print(f"  Monthly usage: {month_used}/{limits['monthly_cap']} used  ({remaining} remaining)")
+        if month_used + estimated > limits["monthly_cap"]:
+            sys.exit(
+                f"\nAborted: {month_used} used + {estimated} estimated = "
+                f"{month_used + estimated} > monthly cap {limits['monthly_cap']}.\n"
+                "Reduce scope, wait until next month, or raise limits.monthly_cap."
+            )
+
     check_budget(estimated, limits)
     print()
 
+    # Per-group accumulators (all written from the main thread via as_completed)
+    group_best_by_pair: list[dict] = [{} for _ in destinations]
+    group_alerts: list[list[dict]] = [[] for _ in destinations]
+    route_errors: list[str] = []
+    calls_made = 0
+
+    # IMP-6: flat task list for concurrent execution
+    tasks = [
+        (g_idx, origin, dest_iata, depart, ret)
+        for g_idx, dest_group in enumerate(destinations)
+        for origin in origins
+        for dest_iata in dest_group["airports"]
+        for depart, ret in date_pairs
+    ]
+
+    def _fetch(g_idx, origin, dest_iata, depart, ret):
+        """Worker: call fetcher. IMP-1: catches all exceptions."""
+        try:
+            offer = fetcher(origin, dest_iata, depart, ret, adults, currency, max_offers, non_stop)
+            return g_idx, origin, dest_iata, depart, ret, offer, None
+        except Exception as exc:
+            return g_idx, origin, dest_iata, depart, ret, None, str(exc)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(_fetch, *t) for t in tasks]
+        for future in as_completed(futures):
+            g_idx, origin, dest_iata, depart, ret, offer, err = future.result()
+            calls_made += 1  # as_completed yields in the main thread — no lock needed
+
+            if err:
+                route_errors.append(f"{origin}→{dest_iata} {depart}: {err}")
+                continue
+            if not offer:
+                continue
+
+            target = destinations[g_idx].get("target_price")
+            obs = {
+                "scanned_at":   now,
+                "origin":       origin,
+                "destination":  dest_iata,
+                "depart_date":  depart,
+                "return_date":  ret,
+                "price":        offer["price"],
+                "currency":     offer["currency"],
+                "carriers":     offer.get("carriers", ""),
+                "stops":        offer.get("stops"),
+                "duration_min": offer.get("duration_min"),
+            }
+            # DB writes are in the main thread — no lock needed
+            record_observation(conn, obs)
+            history = route_price_history(conn, origin, dest_iata, depart, ret)
+            is_bargain, reason = evaluate_bargain(offer["price"], target, history, rules)
+            if is_bargain:
+                group_alerts[g_idx].append({**obs, "reason": reason})
+            pair = (origin, dest_iata)
+            prev = group_best_by_pair[g_idx].get(pair)
+            if prev is None or offer["price"] < prev["price"]:
+                group_best_by_pair[g_idx][pair] = obs
+
+    # IMP-1: surface route errors
+    if route_errors:
+        print(f"  ⚠️  {len(route_errors)} route(s) failed:")
+        for msg in route_errors[:10]:
+            print(f"    {msg}")
+        if len(route_errors) > 10:
+            print(f"    ... and {len(route_errors) - 10} more")
+        print()
+
+    # Aggregate and print per destination group
     all_alerts: list[dict] = []
+    for g_idx, dest_group in enumerate(destinations):
+        label        = dest_group["label"]
+        best_by_pair = group_best_by_pair[g_idx]
+        alerts       = group_alerts[g_idx]
+        all_alerts.extend(alerts)
 
-    # --- FLIGHT-4: iterate per destination group (country / airport) ---
-    for dest_group in destinations:
-        label      = dest_group["label"]
-        target     = dest_group.get("target_price")
-        dest_airports = dest_group["airports"]
-
-        # Collect best offer per (origin, dest_airport) pair
-        # best_by_pair: {(origin, dest_iata): obs_dict}
-        best_by_pair: dict[tuple[str,str], dict] = {}
-        group_alerts: list[dict] = []
-
-        for origin in origins:
-            for dest_iata in dest_airports:
-                for depart, ret in date_pairs:
-                    offer = fetcher(
-                        origin, dest_iata, depart, ret,
-                        adults, currency, max_offers, non_stop,
-                    )
-                    if not offer:
-                        continue
-                    obs = {
-                        "scanned_at":   now,
-                        "origin":       origin,
-                        "destination":  dest_iata,
-                        "depart_date":  depart,
-                        "return_date":  ret,
-                        "price":        offer["price"],
-                        "currency":     offer["currency"],
-                        "carriers":     offer.get("carriers", ""),
-                        "stops":        offer.get("stops"),
-                        "duration_min": offer.get("duration_min"),
-                    }
-                    record_observation(conn, obs)
-                    history = route_price_history(conn, origin, dest_iata, depart, ret)
-                    is_bargain, reason = evaluate_bargain(offer["price"], target, history, rules)
-                    if is_bargain:
-                        group_alerts.append({**obs, "reason": reason})
-                    pair = (origin, dest_iata)
-                    if pair not in best_by_pair or offer["price"] < best_by_pair[pair]["price"]:
-                        best_by_pair[pair] = obs
-
-        all_alerts.extend(group_alerts)
-
-        # --- FLIGHT-4: country-level aggregation ---
         if not best_by_pair:
             print(f"  {label}: no offers found")
             continue
 
-        # Rank all (origin→dest) pairs by price
         ranked = sorted(best_by_pair.values(), key=lambda o: o["price"])
         best   = ranked[0]
         stops_str = ("direct"
@@ -534,19 +704,17 @@ def run_scan(cfg: dict, conn, fetcher, origins: list[str], destinations: list[di
                      else f"{best['stops']} stop(s)"
                      if best.get("stops") is not None
                      else "?")
-        dur = (f" {best['duration_min']//60}h{best['duration_min']%60:02d}m"
-               if best.get("duration_min") else "")
-        fire = " 🔥" if group_alerts else ""
-
+        dur  = (f" {best['duration_min']//60}h{best['duration_min']%60:02d}m"
+                if best.get("duration_min") else "")
+        fire = " 🔥" if alerts else ""
         print(f"  {'['+label+']':22}  best: {best['origin']}→{best['destination']}"
               f"  {best['price']:>8.0f} {best['currency']}"
               f"  {stops_str}{dur}"
               f"  {best['depart_date']}{('..'+best['return_date']) if best['return_date'] else ''}"
               f"{fire}")
 
-        # Show top-3 alternative origins if multiple origins were scanned
         if len(origins) > 1:
-            seen = set()
+            seen  = set()
             count = 0
             for obs in ranked:
                 key = obs["origin"]
@@ -563,15 +731,16 @@ def run_scan(cfg: dict, conn, fetcher, origins: list[str], destinations: list[di
                     break
 
     print()
+    # IMP-2: record this run for monthly quota tracking
+    record_scan_run(conn, calls_made, len(all_alerts))
     return all_alerts
 
 
 # --------------------------------------------------------------------------- #
-# Demo fetcher  (updated for stops/duration + new country destinations)
+# Demo fetcher  (per-call deterministic seed — thread-safe; IMP-6)
 # --------------------------------------------------------------------------- #
 def make_demo_fetcher():
     import random
-    rnd = random.Random(42)
 
     BASE_PRICES = {
         "TGD": 480, "TIV": 460,  # Montenegro
@@ -586,6 +755,11 @@ def make_demo_fetcher():
     }
 
     def fetcher(origin, dest, depart, ret, adults, currency, max_offers, non_stop):
+        # Per-call deterministic seed: same inputs → same result, thread-safe
+        seed_str = f"{origin}|{dest}|{depart}|{ret}"
+        seed = int(hashlib.md5(seed_str.encode()).hexdigest()[:8], 16)
+        rnd = random.Random(seed)
+
         base     = BASE_PRICES.get(dest, 400)
         seasonal = 80 if depart[5:7] in ("07", "08") else 0
         factor   = ORIGIN_FACTOR.get(origin, 1.0)
@@ -633,15 +807,29 @@ def main() -> None:
                         help="Show stored price-history summary and exit.")
     parser.add_argument("--estimate", action="store_true",
                         help="Print estimated API call count and exit (no scan).")
+    parser.add_argument("--quota",    action="store_true",
+                        help="Show month-to-date API call usage and exit.")  # IMP-2
     parser.add_argument("--config",   default=str(CONFIG_PATH))
     args = parser.parse_args()
 
     load_env()
-    conn    = db_connect()
+    conn     = db_connect()
     airports = load_airports()
 
     if args.history:
         show_history(conn)
+        return
+
+    # IMP-2: --quota shows month-to-date usage without needing a config
+    if args.quota:
+        total, runs = monthly_usage(conn)
+        print(f"Month-to-date API calls: {total}  (Amadeus free tier: ~2000/month)")
+        if runs:
+            print(f"\nRecent runs this month ({len(runs)} total):")
+            for r in runs[-15:]:
+                print(f"  {r['run_at']}  calls: {r['calls_made']:>4}  alerts: {r['alerts']}")
+        else:
+            print("\nNo scan runs recorded this month.")
         return
 
     cfg = load_config(Path(args.config))
@@ -677,7 +865,7 @@ def main() -> None:
 
     alerts = run_scan(cfg, conn, fetcher, origins, destinations)
     if alerts:
-        notify(alerts, cfg)
+        notify(alerts, cfg, conn)  # IMP-3: pass conn for cooldown dedup
     else:
         print("No bargains this run (prices stored to history for future comparison).")
 
