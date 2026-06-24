@@ -515,7 +515,7 @@ class AmadeusClient:
         if non_stop:
             params["nonStop"] = "true"
         data = self._get("/v1/shopping/flight-dates", params).get("data", [])
-        results = []
+        results: list[dict] = []
         for item in data:
             try:
                 price = float(item["price"]["total"])
@@ -1050,7 +1050,7 @@ def make_demo_dates_fetcher():
         seed = int(hashlib.md5(seed_str.encode()).hexdigest()[:8], 16)
         rnd = random.Random(seed)
         base = BASE_PRICES.get(dest, 400)
-        results = []
+        results: list[dict] = []
         for month in [7, 8, 9]:
             for day in rnd.sample(range(1, 29), min(4, max_results + 1)):
                 try:

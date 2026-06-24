@@ -82,3 +82,14 @@ jobs:
 
       - name: Run quota (no API key needed)
         run: python flight_scanner.py --quota
+
+      - name: Run demo with CSV export (IMP-10)
+        run: |
+          python flight_scanner.py --demo --export csv
+          ls scan_export_*.csv
+
+      - name: Run demo with verbose logging (IMP-9)
+        run: python flight_scanner.py --demo --verbose
+
+      - name: Run history view
+        run: python flight_scanner.py --history
