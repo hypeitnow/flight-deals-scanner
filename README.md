@@ -37,11 +37,40 @@ cp .env.example .env        # paste your Amadeus key & secret
 Get free Amadeus credentials at <https://developers.amadeus.com/> → **Create app** →
 copy **API Key** and **API Secret** into `.env`. No `pip install` needed (stdlib only).
 
+### Install as a CLI tool (optional)
+
+```bash
+pip install -e .          # installs the `flight-scanner` console command
+flight-scanner --demo     # runs offline demo
+flight-scanner --help
+```
+
+### Docker
+
+```bash
+# Build image
+docker build -t flight-deals-scanner .
+
+# Demo (no credentials needed)
+docker run --rm flight-deals-scanner --demo
+
+# Real scan — mount config + .env, persist prices.db
+docker run --rm \
+  -v $(pwd)/config.json:/app/config.json:ro \
+  -v $(pwd)/.env:/app/.env:ro \
+  -v $(pwd)/prices.db:/app/prices.db \
+  flight-deals-scanner
+
+# Or with Docker Compose
+docker compose run scanner --demo
+```
+
 ## Usage
 
 ```bash
-# Offline demo with synthetic prices (no API key needed):
 python3 flight_scanner.py --demo
+# or, after pip install -e .:
+flight-scanner --demo
 
 # Preview how many API calls a scan would make, without scanning:
 python3 flight_scanner.py --estimate
@@ -51,6 +80,15 @@ python3 flight_scanner.py
 
 # Show stored price-history summary per route:
 python3 flight_scanner.py --history
+
+# Month-to-date API quota usage:
+python3 flight_scanner.py --quota
+
+# Export results to CSV/JSON after scan:
+python3 flight_scanner.py --demo --export csv
+
+# Verbose logging (DEBUG):
+python3 flight_scanner.py --demo --verbose
 ```
 
 ### Example output (demo, Poland → Balkans)
@@ -182,3 +220,43 @@ Tips to reduce calls:
   without an appropriate Amadeus commercial agreement.
 - Airport lists in `data/airports.json` are curated and editable — add or remove
   airports per country as needed.
+
+## Scheduled scanning (GitHub Actions)
+
+The repo ships a **cron workflow** (`.github/workflows/scan.yml`) that turns this into a
+running service with zero infrastructure:
+
+| Feature | Detail |
+|---|---|
+| Schedule | Mon + Thu at 06:00 UTC (≈8 runs/month, well within the 2,000-call free tier) |
+| `prices.db` | Persisted between runs via `actions/cache`; also uploaded as a 90-day artifact |
+| Secrets | `AMADEUS_CLIENT_ID`, `AMADEUS_CLIENT_SECRET`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` |
+| Fallback | No Amadeus secrets → auto-switches to `--demo` mode (safe, no quota used) |
+| Manual run | **Actions → Scheduled Scan → Run workflow** → choose `demo` or `real`, optional export |
+
+### Setup
+
+1. Fork / push to your GitHub account.
+2. **Settings → Secrets → Actions** → add:
+   - `AMADEUS_CLIENT_ID` + `AMADEUS_CLIENT_SECRET` (from Amadeus portal)
+   - `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` *(optional — for Telegram alerts)*
+3. Enable Actions in the repository.
+4. The workflow runs automatically on schedule, or trigger it manually anytime.
+
+> **Tip**: set `notify.telegram.enabled: true` in `config.json` and commit it — the
+> workflow reads Telegram credentials from repo secrets and sends alerts directly to
+> your chat.
+
+## New in v0.4.0
+
+| Feature | How to use |
+|---|---|
+| **Dates mode** (fewer API calls) | `scan.mode: "dates"` in config — one call/route instead of N |
+| **Return-leg metrics** | `stops`/`duration_min` now captured for both outbound and inbound legs |
+| **Stop/duration filters** | `scan.max_stops: 1`, `scan.max_duration_min: 240` |
+| **Structured logging** | `--verbose` (DEBUG) / `--quiet` (WARNING only) |
+| **Run summary** | Always printed: routes, calls, alerts, cheapest overall |
+| **Export** | `--export json` or `--export csv` — includes Kayak + Skyscanner deep-links |
+| **Booking links** | Bargain alerts now include a `🔗 kayak.com` link |
+| **`flight-scanner` CLI** | `pip install -e .` — no more `python3 flight_scanner.py` |
+| **Docker** | `docker build -t flight-deals-scanner . && docker run --rm flight-deals-scanner --demo` |

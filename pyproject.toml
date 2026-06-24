@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flight-deals-scanner"
+version = "0.4.0"
+description = "Multi-origin flight bargain scanner using the Amadeus Self-Service API"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+keywords = ["flights", "travel", "bargain", "amadeus", "scanner"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+
+# Zero third-party dependencies — stdlib only
+dependencies = []
+
+[project.scripts]
+flight-scanner = "flight_scanner:main"
+
+[tool.setuptools]
+# Single-module project — flight_scanner.py in the root
+py-modules = ["flight_scanner"]
+# Include airport reference data
+include-package-data = true
+
+[tool.setuptools.data-files]
+"." = ["config.json"]
+"data" = ["data/airports.json"]

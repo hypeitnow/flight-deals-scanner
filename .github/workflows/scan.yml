@@ -1,0 +1,124 @@
+name: Scheduled Scan
+
+on:
+  # Run Mon + Thu at 06:00 UTC — conservative quota use (~8 runs/month)
+  schedule:
+    - cron: "0 6 * * 1,4"
+
+  # Manual trigger: run a demo or real scan on demand
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Scan mode"
+        required: true
+        default: "demo"
+        type: choice
+        options:
+          - demo
+          - real
+      export:
+        description: "Export format (leave blank to skip)"
+        required: false
+        default: ""
+        type: choice
+        options:
+          - ""
+          - json
+          - csv
+
+jobs:
+  scan:
+    name: Flight Bargain Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install package
+        run: pip install -e .
+
+      # ── Persist prices.db across runs via Actions cache ─────────────────────
+      - name: Restore prices.db cache
+        id: cache-db
+        uses: actions/cache@v4
+        with:
+          path: prices.db
+          key: prices-db-${{ github.ref_name }}
+          restore-keys: |
+            prices-db-
+
+      # ── Determine run mode ───────────────────────────────────────────────────
+      # Scheduled runs: use 'real' if Amadeus secrets are set, else 'demo'
+      # Manual runs: respect the 'mode' input
+      - name: Resolve run mode
+        id: resolve-mode
+        env:
+          AMADEUS_CLIENT_ID: ${{ secrets.AMADEUS_CLIENT_ID }}
+          INPUT_MODE: ${{ github.event.inputs.mode || 'auto' }}
+        run: |
+          if [[ "$INPUT_MODE" == "demo" ]]; then
+            echo "mode=demo" >> "$GITHUB_OUTPUT"
+          elif [[ -n "$AMADEUS_CLIENT_ID" ]]; then
+            echo "mode=real" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=demo" >> "$GITHUB_OUTPUT"
+            echo "::notice::No AMADEUS_CLIENT_ID secret — running in demo mode"
+          fi
+
+      # ── Demo scan ────────────────────────────────────────────────────────────
+      - name: Run demo scan
+        if: steps.resolve-mode.outputs.mode == 'demo'
+        run: |
+          flight-scanner --demo ${{ github.event.inputs.export && format('--export {0}', github.event.inputs.export) || '' }}
+
+      # ── Real scan ────────────────────────────────────────────────────────────
+      - name: Run real scan
+        if: steps.resolve-mode.outputs.mode == 'real'
+        env:
+          AMADEUS_CLIENT_ID:     ${{ secrets.AMADEUS_CLIENT_ID }}
+          AMADEUS_CLIENT_SECRET: ${{ secrets.AMADEUS_CLIENT_SECRET }}
+          TELEGRAM_BOT_TOKEN:    ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:      ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          flight-scanner ${{ github.event.inputs.export && format('--export {0}', github.event.inputs.export) || '' }}
+
+      # ── Show quota usage after real scan ─────────────────────────────────────
+      - name: Show API quota usage
+        if: steps.resolve-mode.outputs.mode == 'real'
+        env:
+          AMADEUS_CLIENT_ID:     ${{ secrets.AMADEUS_CLIENT_ID }}
+          AMADEUS_CLIENT_SECRET: ${{ secrets.AMADEUS_CLIENT_SECRET }}
+        run: flight-scanner --quota
+
+      # ── Save updated prices.db back to cache ─────────────────────────────────
+      - name: Save prices.db cache
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: prices.db
+          key: prices-db-${{ github.ref_name }}-${{ github.run_id }}
+
+      # ── Upload prices.db as artifact (90-day retention) ──────────────────────
+      - name: Upload prices.db artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: prices-db-${{ github.run_number }}
+          path: prices.db
+          retention-days: 90
+          if-no-files-found: ignore
+
+      # ── Upload export file if produced ───────────────────────────────────────
+      - name: Upload export artifact
+        uses: actions/upload-artifact@v4
+        if: ${{ github.event.inputs.export != '' }}
+        with:
+          name: scan-export-${{ github.run_number }}
+          path: "scan_export_*"
+          if-no-files-found: ignore

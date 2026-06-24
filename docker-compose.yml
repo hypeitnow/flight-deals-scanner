@@ -1,0 +1,18 @@
+# syntax=docker/dockerfile:1
+# Build: docker compose run scanner --demo
+# Real:  docker compose run scanner  (needs .env with Amadeus creds)
+
+services:
+  scanner:
+    build: .
+    image: flight-deals-scanner:latest
+    volumes:
+      # Persist prices.db between runs
+      - ./prices.db:/app/prices.db
+      # Mount your local config and .env
+      - ./config.json:/app/config.json:ro
+      - ./.env:/app/.env:ro
+    env_file:
+      - .env
+    # Override CMD at runtime:  docker compose run scanner --history
+    command: ["--demo"]
